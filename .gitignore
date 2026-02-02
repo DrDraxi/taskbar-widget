@@ -1,0 +1,81 @@
+# Build results
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+bld/
+[Bb]in/
+[Oo]bj/
+[Oo]ut/
+[Ll]og/
+[Ll]ogs/
+
+# Visual Studio
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# User-specific files
+*.rsuser
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Build results
+[Dd]ebugPublic/
+[Rr]eleasePublic/
+*.cache
+*.ilk
+*.meta
+*.pdb
+*.pgc
+*.pgd
+*.rsp
+*.sbr
+*.tlb
+*.tli
+*.tlh
+*.tmp
+*.tmp_proj
+*_wpftmp.csproj
+*.log
+*.vspscc
+*.vssscc
+.builds
+*.pidb
+*.svclog
+
+# Publish
+publish/
+
+# NuGet packages
+*.nupkg
+*.snupkg
+.nuget/
+nuget.exe
+**/[Pp]ackages/*
+!**/[Pp]ackages/build/
+*.nuget.props
+*.nuget.targets
+
+# JetBrains Rider
+.idea/
+
+# Windows Installer files
+*.msi
+*.msm
+*.msp
+
+# Windows image files
+*.appx
+*.appxbundle
+*.appxupload
+
+# Generated files
+Generated\ Files/
+**/launchSettings.json
