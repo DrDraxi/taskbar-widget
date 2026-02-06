@@ -1,6 +1,4 @@
 using System.Runtime.InteropServices;
-using Microsoft.UI.Windowing;
-using Windows.Graphics;
 
 namespace TaskbarWidget;
 
@@ -41,11 +39,27 @@ public sealed class TaskbarInjectionConfig
 
     /// <summary>
     /// If true, Initialize() creates the window but does not inject it into the taskbar.
-    /// Call Inject() separately after setting up XAML content.
-    /// This is required for WinUI apps using DesktopWindowXamlSource.
+    /// Call Inject() separately after setting up content.
     /// </summary>
     public bool DeferInjection { get; init; } = false;
+
+    /// <summary>
+    /// Custom WndProc callback. If null, DefWindowProcW is used.
+    /// </summary>
+    public WndProcDelegate? WndProc { get; init; }
+
+    /// <summary>
+    /// Extended window style flags for the host window.
+    /// Defaults to WS_EX_LAYERED for compatibility.
+    /// Set to 0 for standard GDI rendering.
+    /// </summary>
+    public int ExStyle { get; init; } = Native.WS_EX_LAYERED;
 }
+
+/// <summary>
+/// Delegate for custom window procedures.
+/// </summary>
+public delegate IntPtr WndProcDelegate(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam);
 
 /// <summary>
 /// Result of taskbar injection initialization.
@@ -56,7 +70,6 @@ public sealed class TaskbarInjectionResult
     public string? Error { get; init; }
     public IntPtr WindowHandle { get; init; }
     public IntPtr TaskbarHandle { get; init; }
-    public AppWindow? AppWindow { get; init; }
     public int Width { get; init; }
     public int Height { get; init; }
     public double DpiScale { get; init; }
@@ -73,22 +86,20 @@ public sealed class TaskbarInjectionHelper : IDisposable
 
     private IntPtr _hwnd;
     private IntPtr _hwndTaskbar;
-    private AppWindow? _appWindow;
     private TaskbarSlotFinder? _slotFinder;
     private int _widgetWidth;
+    private int _widgetHeight;
     private double _dpiScale = 1.0;
     private bool _isVisible;
     private bool _disposed;
     private bool _classRegistered;
 
-    private delegate IntPtr WndProcDelegate(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam);
-    private static readonly Dictionary<string, WndProcDelegate> _wndProcDelegates = new();
+    // Must keep a reference to prevent GC collection of the delegate
+    private WndProcDelegate? _wndProcDelegate;
 
     /// <summary>
     /// Create a new taskbar injection helper.
     /// </summary>
-    /// <param name="config">Configuration for the injection.</param>
-    /// <param name="log">Optional logging callback. Receives log messages.</param>
     public TaskbarInjectionHelper(TaskbarInjectionConfig config, Action<string>? log = null)
     {
         _config = config;
@@ -98,10 +109,9 @@ public sealed class TaskbarInjectionHelper : IDisposable
     public bool IsVisible => _isVisible;
     public IntPtr WindowHandle => _hwnd;
     public IntPtr TaskbarHandle => _hwndTaskbar;
-    public AppWindow? AppWindow => _appWindow;
     public double DpiScale => _dpiScale;
     public int Width => _widgetWidth;
-    public int Height => _slotFinder?.TaskbarBounds.Height ?? 0;
+    public int Height => _widgetHeight;
 
     /// <summary>
     /// Initializes the widget window and optionally injects it into the taskbar.
@@ -123,6 +133,7 @@ public sealed class TaskbarInjectionHelper : IDisposable
             _hwndTaskbar = _slotFinder.TaskbarHandle;
             _dpiScale = _slotFinder.DpiScale;
             _widgetWidth = (int)Math.Ceiling(_dpiScale * _config.WidthDip);
+            _widgetHeight = _slotFinder.TaskbarBounds.Height;
 
             Log($"Taskbar: {_hwndTaskbar:X}, DPI scale: {_dpiScale}, Width: {_widgetWidth}");
 
@@ -135,12 +146,9 @@ public sealed class TaskbarInjectionHelper : IDisposable
                 return new TaskbarInjectionResult { Success = false, Error = "Failed to create host window" };
             }
 
-            var windowId = Microsoft.UI.Win32Interop.GetWindowIdFromWindow(_hwnd);
-            _appWindow = AppWindow.GetFromWindowId(windowId);
-            _appWindow.IsShownInSwitchers = false;
-
-            var height = _slotFinder.TaskbarBounds.Height;
-            _appWindow.ResizeClient(new SizeInt32(_widgetWidth, height));
+            // Size the window
+            Native.SetWindowPos(_hwnd, IntPtr.Zero, 0, 0, _widgetWidth, _widgetHeight,
+                Native.SWP_NOMOVE | Native.SWP_NOZORDER | Native.SWP_NOACTIVATE);
 
             if (!_config.DeferInjection)
             {
@@ -160,9 +168,8 @@ public sealed class TaskbarInjectionHelper : IDisposable
                 Success = true,
                 WindowHandle = _hwnd,
                 TaskbarHandle = _hwndTaskbar,
-                AppWindow = _appWindow,
                 Width = _widgetWidth,
-                Height = height,
+                Height = _widgetHeight,
                 DpiScale = _dpiScale
             };
         }
@@ -178,7 +185,7 @@ public sealed class TaskbarInjectionHelper : IDisposable
         RegisterWindowClass();
 
         var hwnd = Native.CreateWindowExW(
-            Native.WS_EX_LAYERED, _config.ClassName, _config.WindowTitle, Native.WS_POPUP,
+            _config.ExStyle, _config.ClassName, _config.WindowTitle, Native.WS_POPUP,
             0, 0, 0, 0, _hwndTaskbar, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
 
         Log($"Created host window: {hwnd:X}");
@@ -189,13 +196,12 @@ public sealed class TaskbarInjectionHelper : IDisposable
     {
         if (_classRegistered) return;
 
-        if (!_wndProcDelegates.ContainsKey(_config.ClassName))
-            _wndProcDelegates[_config.ClassName] = WndProc;
+        _wndProcDelegate = _config.WndProc ?? DefaultWndProc;
 
         var wndClass = new Native.WNDCLASS
         {
             lpszClassName = _config.ClassName,
-            lpfnWndProc = Marshal.GetFunctionPointerForDelegate(_wndProcDelegates[_config.ClassName]),
+            lpfnWndProc = Marshal.GetFunctionPointerForDelegate(_wndProcDelegate),
             hInstance = Native.GetModuleHandleW(null)
         };
 
@@ -205,7 +211,7 @@ public sealed class TaskbarInjectionHelper : IDisposable
         Log($"Registered window class: {_classRegistered}, atom: {atom}");
     }
 
-    private static IntPtr WndProc(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam) =>
+    private static IntPtr DefaultWndProc(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam) =>
         Native.DefWindowProcW(hwnd, msg, wParam, lParam);
 
     private bool InjectIntoTaskbar()
@@ -230,7 +236,7 @@ public sealed class TaskbarInjectionHelper : IDisposable
     }
 
     /// <summary>
-    /// Injects the window into the taskbar. Call this after setting up XAML content
+    /// Injects the window into the taskbar. Call this after setting up content
     /// when using DeferInjection = true.
     /// </summary>
     public bool Inject()
@@ -253,7 +259,7 @@ public sealed class TaskbarInjectionHelper : IDisposable
     /// </summary>
     public void UpdatePosition()
     {
-        if (_appWindow == null || _hwndTaskbar == IntPtr.Zero) return;
+        if (_hwnd == IntPtr.Zero || _hwndTaskbar == IntPtr.Zero) return;
 
         _slotFinder = new TaskbarSlotFinder();
         var slot = _slotFinder.FindSlot(_widgetWidth, _hwnd, _config.Margin, _log);
@@ -262,12 +268,15 @@ public sealed class TaskbarInjectionHelper : IDisposable
         {
             Log("No valid slot found, using fallback position");
             Native.GetWindowRect(_hwndTaskbar, out var taskbarRect);
-            _appWindow.MoveAndResize(new RectInt32(
-                taskbarRect.Width - _widgetWidth - 100, 0, _widgetWidth, taskbarRect.Height));
+            Native.SetWindowPos(_hwnd, IntPtr.Zero,
+                taskbarRect.Width - _widgetWidth - 100, 0, _widgetWidth, taskbarRect.Height,
+                Native.SWP_NOZORDER | Native.SWP_NOACTIVATE);
             return;
         }
 
-        _appWindow.MoveAndResize(new RectInt32(slot.X, slot.Y, _widgetWidth, slot.Height));
+        Native.SetWindowPos(_hwnd, IntPtr.Zero,
+            slot.X, slot.Y, _widgetWidth, slot.Height,
+            Native.SWP_NOZORDER | Native.SWP_NOACTIVATE);
         Log($"Positioned at ({slot.X}, {slot.Y}), size ({_widgetWidth}x{slot.Height})");
     }
 
@@ -277,7 +286,7 @@ public sealed class TaskbarInjectionHelper : IDisposable
     public void Show()
     {
         if (_disposed || _hwnd == IntPtr.Zero) return;
-        Native.ShowWindow(_hwnd, 5); // SW_SHOW
+        Native.ShowWindow(_hwnd, Native.SW_SHOW);
         _isVisible = true;
         Log("Window shown");
     }
@@ -288,7 +297,7 @@ public sealed class TaskbarInjectionHelper : IDisposable
     public void Hide()
     {
         if (_hwnd == IntPtr.Zero) return;
-        Native.ShowWindow(_hwnd, 0); // SW_HIDE
+        Native.ShowWindow(_hwnd, Native.SW_HIDE);
         _isVisible = false;
         Log("Window hidden");
     }
@@ -328,15 +337,16 @@ public sealed class TaskbarInjectionHelper : IDisposable
     /// <summary>
     /// Resize the widget width.
     /// </summary>
-    /// <param name="widthDip">New width in device-independent pixels.</param>
     public void Resize(int widthDip)
     {
         _widgetWidth = (int)Math.Ceiling(_dpiScale * widthDip);
 
-        if (_appWindow != null && _slotFinder != null)
+        if (_hwnd != IntPtr.Zero && _slotFinder != null)
         {
-            var height = _slotFinder.TaskbarBounds.Height;
-            _appWindow.ResizeClient(new SizeInt32(_widgetWidth, height));
+            _widgetHeight = _slotFinder.TaskbarBounds.Height;
+            Native.SetWindowPos(_hwnd, IntPtr.Zero,
+                0, 0, _widgetWidth, _widgetHeight,
+                Native.SWP_NOMOVE | Native.SWP_NOZORDER | Native.SWP_NOACTIVATE);
             UpdatePosition();
         }
     }
@@ -353,7 +363,6 @@ public sealed class TaskbarInjectionHelper : IDisposable
             catch { }
             _hwnd = IntPtr.Zero;
         }
-        _appWindow = null;
     }
 
     private void Log(string message) => _log?.Invoke(message);
