@@ -1,19 +1,11 @@
-using Microsoft.UI.Dispatching;
-using Microsoft.UI.Xaml;
+using TaskbarWidget;
+using TaskbarWidget.Rendering;
 
-namespace HelloWorld;
-
-public static class Program
+var widget = new Widget("HelloWorld", render: ctx =>
 {
-    [STAThread]
-    public static void Main(string[] args)
-    {
-        WinRT.ComWrappersSupport.InitializeComWrappers();
-        Application.Start(p =>
-        {
-            var context = new DispatcherQueueSynchronizationContext(DispatcherQueue.GetForCurrentThread());
-            SynchronizationContext.SetSynchronizationContext(context);
-            _ = new App();
-        });
-    }
-}
+    ctx.DrawText("Hello!", new TextStyle { FontSizeDip = 13, FontWeight = 700 });
+    ctx.Tooltip("Hello World", "This is a sample taskbar widget.");
+});
+
+widget.Show();
+Widget.RunMessageLoop();

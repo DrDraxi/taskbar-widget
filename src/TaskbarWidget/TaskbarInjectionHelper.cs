@@ -200,6 +200,7 @@ public sealed class TaskbarInjectionHelper : IDisposable
 
         var wndClass = new Native.WNDCLASS
         {
+            style = Native.CS_DBLCLKS,
             lpszClassName = _config.ClassName,
             lpfnWndProc = Marshal.GetFunctionPointerForDelegate(_wndProcDelegate),
             hInstance = Native.GetModuleHandleW(null)
@@ -335,11 +336,19 @@ public sealed class TaskbarInjectionHelper : IDisposable
     }
 
     /// <summary>
-    /// Resize the widget width.
+    /// Resize the widget width (DIP).
     /// </summary>
     public void Resize(int widthDip)
     {
-        _widgetWidth = (int)Math.Ceiling(_dpiScale * widthDip);
+        ResizePixels((int)Math.Ceiling(_dpiScale * widthDip));
+    }
+
+    /// <summary>
+    /// Resize the widget width (physical pixels).
+    /// </summary>
+    public void ResizePixels(int widthPx)
+    {
+        _widgetWidth = widthPx;
 
         if (_hwnd != IntPtr.Zero && _slotFinder != null)
         {

@@ -18,6 +18,8 @@ public static class Native
     public const int SWP_NOACTIVATE = 0x0010;
     public const int SWP_SHOWWINDOW = 0x0040;
 
+    public static readonly IntPtr HWND_TOPMOST = (IntPtr)(-1);
+
     public const int SW_HIDE = 0;
     public const int SW_SHOW = 5;
 
@@ -25,10 +27,21 @@ public static class Native
     public const uint WM_MOUSEMOVE = 0x0200;
     public const uint WM_MOUSELEAVE = 0x02A3;
     public const uint WM_LBUTTONDOWN = 0x0201;
+    public const uint WM_LBUTTONUP = 0x0202;
+    public const uint WM_LBUTTONDBLCLK = 0x0203;
+    public const uint WM_RBUTTONDOWN = 0x0204;
+    public const uint WM_RBUTTONUP = 0x0205;
+    public const uint WM_TIMER = 0x0113;
+    public const uint WM_SETTINGCHANGE = 0x001A;
+    public const uint WM_DROPFILES = 0x0233;
     public const uint WM_SETCURSOR = 0x0020;
+    public const uint WM_CAPTURECHANGED = 0x0215;
     public const uint WM_DESTROY = 0x0002;
     public const uint WM_USER = 0x0400;
     public const uint WM_NOTIFY = 0x004E;
+
+    // Window class styles
+    public const uint CS_DBLCLKS = 0x0008;
 
     // GDI constants
     public const int TRANSPARENT = 1;
@@ -179,6 +192,10 @@ public static class Native
 
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool DestroyWindow(IntPtr hWnd);
 
     [DllImport("user32.dll")]
@@ -208,6 +225,69 @@ public static class Native
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool KillTimer(IntPtr hWnd, IntPtr uIDEvent);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr SetCapture(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool ReleaseCapture();
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern IntPtr LoadCursorW(IntPtr hInstance, int lpCursorName);
+
+    public const int IDC_ARROW = 32512;
+    public const int IDC_HAND = 32649;
+    public const int IDC_SIZEALL = 32646;
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr SetCursor(IntPtr hCursor);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetCursorPos(out POINT lpPoint);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool ScreenToClient(IntPtr hWnd, ref POINT lpPoint);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern uint RegisterWindowMessageW(string lpString);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool PostMessageW(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+
+    public const IntPtr HWND_BROADCAST = (nint)0xFFFF;
+
+    // Drag-and-drop
+    [DllImport("shell32.dll")]
+    public static extern void DragAcceptFiles(IntPtr hWnd, [MarshalAs(UnmanagedType.Bool)] bool fAccept);
+
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    public static extern uint DragQueryFileW(IntPtr hDrop, uint iFile, System.Text.StringBuilder? lpszFile, uint cch);
+
+    [DllImport("shell32.dll")]
+    public static extern void DragFinish(IntPtr hDrop);
+
+    // Monitor info for tooltip clamping
+    [DllImport("user32.dll")]
+    public static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
+
+    public const uint MONITOR_DEFAULTTONEAREST = 2;
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MONITORINFO
+    {
+        public int cbSize;
+        public RECT rcMonitor;
+        public RECT rcWork;
+        public uint dwFlags;
+    }
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetMonitorInfoW(IntPtr hMonitor, ref MONITORINFO lpmi);
 
     #endregion
 

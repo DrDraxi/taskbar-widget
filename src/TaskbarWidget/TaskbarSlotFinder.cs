@@ -120,13 +120,50 @@ public sealed class TaskbarSlotFinder
 
     /// <summary>
     /// Get only injected (non-system) visible windows in the taskbar.
+    /// Finds both child windows and top-level TaskbarWidget windows positioned over the taskbar.
     /// </summary>
     public List<TaskbarChildInfo> GetInjectedWindows()
     {
-        return GetChildWindows()
-            .Where(c => c.IsVisible && !c.IsSystemWindow)
-            .OrderBy(c => c.LeftEdge)
-            .ToList();
+        var injected = new List<TaskbarChildInfo>();
+
+        // Find child windows of taskbar that aren't system windows
+        foreach (var child in GetChildWindows())
+        {
+            if (child.IsVisible && !child.IsSystemWindow)
+                injected.Add(child);
+        }
+
+        // Also find top-level TaskbarWidget windows (not parented to taskbar)
+        Native.EnumWindows((hwnd, _) =>
+        {
+            if (!Native.IsWindowVisible(hwnd)) return true;
+
+            var className = Native.GetClassName(hwnd);
+            if (!className.StartsWith("TaskbarWidget_", StringComparison.Ordinal)) return true;
+
+            // Check if already found as a child
+            foreach (var existing in injected)
+                if (existing.Handle == hwnd) return true;
+
+            Native.GetWindowRect(hwnd, out var rect);
+            var leftEdge = rect.Left - _taskbarRect.Left;
+            var rightEdge = rect.Right - _taskbarRect.Left;
+
+            injected.Add(new TaskbarChildInfo
+            {
+                Handle = hwnd,
+                ClassName = className,
+                Bounds = Bounds.FromNative(rect),
+                IsVisible = true,
+                IsSystemWindow = false,
+                LeftEdge = leftEdge,
+                RightEdge = rightEdge
+            });
+
+            return true;
+        }, IntPtr.Zero);
+
+        return injected.OrderBy(c => c.LeftEdge).ToList();
     }
 
     /// <summary>
@@ -138,6 +175,15 @@ public sealed class TaskbarSlotFinder
     /// <param name="log">Optional logging callback.</param>
     /// <returns>A TaskbarSlot indicating where the widget should be positioned.</returns>
     public TaskbarSlot FindSlot(int widgetWidth, IntPtr ownHandle = default, int margin = 4, Action<string>? log = null)
+    {
+        return FindSlot(widgetWidth, ownHandle, margin, orderIndex: -1, log);
+    }
+
+    /// <summary>
+    /// Finds an available slot with order-awareness.
+    /// When orderIndex >= 0, positions widgets left-to-right by order (index 0 = rightmost).
+    /// </summary>
+    public TaskbarSlot FindSlot(int widgetWidth, IntPtr ownHandle, int margin, int orderIndex, Action<string>? log = null)
     {
         if (_hwndTaskbar == IntPtr.Zero)
             return new TaskbarSlot { IsValid = false };
@@ -161,6 +207,23 @@ public sealed class TaskbarSlotFinder
         int slotX = rightBoundary - widgetWidth;
         int slotRight = rightBoundary;
 
+        if (orderIndex >= 0 && injectedWindows.Count > 0)
+        {
+            // Order-aware: position by index from right edge.
+            // Each widget at a lower index is further right.
+            // Skip past 'orderIndex' worth of existing widgets from the right.
+            int offset = 0;
+            var sorted = injectedWindows.OrderByDescending(w => w.RightEdge).ToList();
+            int widgetsToSkip = orderIndex;
+            for (int i = 0; i < sorted.Count && i < widgetsToSkip; i++)
+            {
+                offset += sorted[i].Bounds.Width + margin;
+            }
+            slotRight = rightBoundary - offset;
+            slotX = slotRight - widgetWidth;
+        }
+
+        // Collision detection with remaining windows
         foreach (var widget in injectedWindows)
         {
             bool overlaps = !(slotRight <= widget.LeftEdge || slotX >= widget.RightEdge);
@@ -177,7 +240,7 @@ public sealed class TaskbarSlotFinder
 
         var availableWidth = slotRight - slotX;
 
-        log?.Invoke($"Slot found: X={slotX}, Width={widgetWidth}, RightBoundary={rightBoundary}, Widgets={injectedWindows.Count}");
+        log?.Invoke($"Slot found: X={slotX}, Width={widgetWidth}, RightBoundary={rightBoundary}, Widgets={injectedWindows.Count}, Order={orderIndex}");
 
         return new TaskbarSlot
         {
