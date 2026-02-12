@@ -5,12 +5,14 @@ namespace TaskbarWidget.Interaction;
 /// <summary>
 /// Handles drag-to-reorder of taskbar widgets.
 /// 5px horizontal dead zone discriminates clicks from drags.
-/// During drag, other widgets slide in real-time to show the new order.
+/// During drag, other widgets slide smoothly to show the new order.
 /// </summary>
 internal sealed class DragManager
 {
     private const int DragThreshold = 5;
     private const int Margin = 4;
+    private const double LerpFactor = 0.25;
+    private const double SnapThreshold = 0.5;
 
     private bool _isDragging;
     private bool _mouseDown;
@@ -23,6 +25,9 @@ internal sealed class DragManager
     // Target slot for dragged widget, calculated during LiveReorder
     private int _targetScreenX;
     private int _targetScreenY;
+
+    // Smooth animation: tracks current animated X position per widget handle
+    private readonly Dictionary<IntPtr, double> _animatedX = new();
 
     public bool IsDragging => _isDragging;
     public bool IsMouseDown => _mouseDown;
@@ -53,6 +58,7 @@ internal sealed class DragManager
         _startScreenX = screenX;
         _startScreenY = screenY;
         _lastPreviewOrder = null;
+        _animatedX.Clear();
 
         Native.GetWindowRect(hwnd, out var rect);
         _offsetX = screenX - rect.Left;
@@ -113,6 +119,7 @@ internal sealed class DragManager
         }
 
         _lastPreviewOrder = null;
+        _animatedX.Clear();
         Native.ReleaseCapture();
 
         if (wasDragging)
@@ -134,11 +141,12 @@ internal sealed class DragManager
         _mouseDown = false;
         _isDragging = false;
         _lastPreviewOrder = null;
+        _animatedX.Clear();
     }
 
     /// <summary>
     /// During drag, enumerate all widgets, determine order from positions,
-    /// and slide non-dragged widgets to their correct slots.
+    /// and smoothly slide non-dragged widgets toward their correct slots.
     /// Also calculates the target slot for the dragged widget.
     /// </summary>
     private void LiveReorder(IntPtr draggedHwnd)
@@ -169,15 +177,9 @@ internal sealed class DragManager
             return centerB.CompareTo(centerA);
         });
 
-        var newOrder = widgets.Select(w => w.Name).ToArray();
+        _lastPreviewOrder = widgets.Select(w => w.Name).ToArray();
 
-        // Only reposition if order changed
-        if (_lastPreviewOrder != null && newOrder.SequenceEqual(_lastPreviewOrder))
-            return;
-
-        _lastPreviewOrder = newOrder;
-
-        // Calculate slots and move non-dragged widgets
+        // Calculate target positions
         var taskbar = Native.FindTaskbar();
         if (taskbar == IntPtr.Zero) return;
 
@@ -195,23 +197,40 @@ internal sealed class DragManager
             rightBoundary = taskbarRect.Right - 100;
         }
 
-        // Position right-to-left, skipping the dragged widget (it follows the cursor)
+        // Position right-to-left, lerping non-dragged widgets toward targets
         int currentRight = rightBoundary;
         foreach (var w in widgets)
         {
+            int targetX = currentRight - w.Width;
+
             if (w.Hwnd == draggedHwnd)
             {
                 // Store where the dragged widget WOULD go (its target slot)
-                _targetScreenX = currentRight - w.Width;
+                _targetScreenX = targetX;
                 _targetScreenY = taskbarRect.Top;
                 currentRight -= w.Width + Margin;
                 continue;
             }
 
-            int screenX = currentRight - w.Width;
-            Native.SetWindowPos(w.Hwnd, Native.HWND_TOPMOST, screenX, taskbarRect.Top, 0, 0,
+            // Initialize animated position from current screen position if new
+            if (!_animatedX.TryGetValue(w.Hwnd, out double currentX))
+            {
+                currentX = w.ScreenX;
+                _animatedX[w.Hwnd] = currentX;
+            }
+
+            // Lerp toward target
+            double newX = currentX + (targetX - currentX) * LerpFactor;
+
+            // Snap when close enough to avoid sub-pixel jitter
+            if (Math.Abs(newX - targetX) < SnapThreshold)
+                newX = targetX;
+
+            _animatedX[w.Hwnd] = newX;
+
+            Native.SetWindowPos(w.Hwnd, Native.HWND_TOPMOST, (int)Math.Round(newX), taskbarRect.Top, 0, 0,
                 Native.SWP_NOSIZE | Native.SWP_NOACTIVATE);
-            currentRight = screenX - Margin;
+            currentRight -= w.Width + Margin;
         }
     }
 }

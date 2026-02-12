@@ -278,6 +278,7 @@ internal static class GdiRenderer
                 }
 
                 if ((srcPixel >> 24) == 0) continue;
+
                 BlendPixel(px, py * stride + px2, srcPixel);
             }
         }

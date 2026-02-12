@@ -24,6 +24,12 @@ public sealed class Widget : IDisposable
     private const int ContentPaddingLeft = 6;
     private const int ContentPaddingRight = 6;
 
+    // Resize animation constants
+    private const int ResizeAnimTimerId = 9998;
+    private const int ResizeAnimIntervalMs = 16; // ~60fps
+    private const double ResizeAnimLerp = 0.25;
+    private const double ResizeAnimSnap = 0.5;
+
     private readonly string _name;
     private readonly Action<RenderContext> _render;
     private readonly WidgetOptions _options;
@@ -51,6 +57,12 @@ public sealed class Widget : IDisposable
     private LayoutNode? _rootNode;
     private string? _widgetTooltipTitle;
     private string? _widgetTooltipBody;
+
+    // Resize animation state: this widget drives smooth repositioning
+    // of ALL widgets when its own size changes.
+    private Dictionary<IntPtr, double>? _resizeAnimX;
+    private Dictionary<IntPtr, int>? _resizeTargetX;
+    private int _resizeAnimY;
 
     /// <summary>
     /// Create a new widget.
@@ -262,13 +274,146 @@ public sealed class Widget : IDisposable
             Native.SWP_NOACTIVATE);
     }
 
+    /// <summary>
+    /// Start a smooth resize animation that lerps all widgets to their
+    /// new positions over several frames, instead of snapping instantly.
+    /// </summary>
+    private void StartResizeAnimation()
+    {
+        var taskbar = Native.FindTaskbar();
+        if (taskbar == IntPtr.Zero) { PositionOverTaskbar(); return; }
+
+        Native.GetWindowRect(taskbar, out var taskbarRect);
+        var trayNotify = Native.FindTrayNotifyWnd(taskbar);
+
+        const int margin = 4;
+        int rightBoundary;
+        if (trayNotify != IntPtr.Zero)
+        {
+            Native.GetWindowRect(trayNotify, out var trayRect);
+            rightBoundary = trayRect.Left - margin;
+        }
+        else
+        {
+            rightBoundary = taskbarRect.Right - 100;
+        }
+
+        // Get order and enumerate all widget windows
+        var order = WidgetOrderManager.GetOrder();
+        var windows = new Dictionary<string, (IntPtr Hwnd, int Width, int CurrentX)>();
+
+        Native.EnumWindows((hwnd, _) =>
+        {
+            if (!Native.IsWindowVisible(hwnd)) return true;
+            var className = Native.GetClassName(hwnd);
+            if (!className.StartsWith("TaskbarWidget_", StringComparison.Ordinal)) return true;
+
+            string name = className.Substring("TaskbarWidget_".Length);
+            Native.GetWindowRect(hwnd, out var rect);
+            // Use our new width for self (on-screen rect still has old size)
+            int width = (hwnd == _hwnd) ? _width : rect.Width;
+            windows[name] = (hwnd, width, rect.Left);
+            return true;
+        }, IntPtr.Zero);
+
+        if (windows.Count < 2)
+        {
+            // Only one widget — just position directly, no animation needed
+            PositionOverTaskbar();
+            return;
+        }
+
+        // Calculate target positions right-to-left following saved order
+        _resizeAnimX ??= new Dictionary<IntPtr, double>();
+        _resizeTargetX = new Dictionary<IntPtr, int>();
+        _resizeAnimY = taskbarRect.Top;
+
+        int currentRight = rightBoundary;
+        foreach (var name in order)
+        {
+            if (!windows.TryGetValue(name, out var w)) continue;
+            int targetX = currentRight - w.Width;
+
+            // Initialize animated position from current screen position if new
+            if (!_resizeAnimX.ContainsKey(w.Hwnd))
+                _resizeAnimX[w.Hwnd] = w.CurrentX;
+
+            _resizeTargetX[w.Hwnd] = targetX;
+            currentRight = targetX - margin;
+        }
+
+        // Start the animation timer
+        Native.SetTimer(_hwnd, (IntPtr)ResizeAnimTimerId, ResizeAnimIntervalMs, IntPtr.Zero);
+    }
+
+    /// <summary>
+    /// Called on each animation timer tick. Lerps all widgets toward their
+    /// target positions and stops when everyone has arrived.
+    /// </summary>
+    private void OnResizeAnimTick()
+    {
+        if (_resizeAnimX == null || _resizeTargetX == null)
+        {
+            Native.KillTimer(_hwnd, (IntPtr)ResizeAnimTimerId);
+            return;
+        }
+
+        bool allDone = true;
+
+        foreach (var hwnd in _resizeTargetX.Keys)
+        {
+            int target = _resizeTargetX[hwnd];
+
+            if (!_resizeAnimX.TryGetValue(hwnd, out double current))
+                current = target;
+
+            double newX = current + (target - current) * ResizeAnimLerp;
+
+            if (Math.Abs(newX - target) < ResizeAnimSnap)
+                newX = target;
+            else
+                allDone = false;
+
+            _resizeAnimX[hwnd] = newX;
+
+            if (hwnd == _hwnd)
+            {
+                // Self: set both position and size
+                Native.SetWindowPos(hwnd, Native.HWND_TOPMOST,
+                    (int)Math.Round(newX), _resizeAnimY, _width, _height,
+                    Native.SWP_NOACTIVATE);
+            }
+            else
+            {
+                // Other widgets: position only
+                Native.SetWindowPos(hwnd, Native.HWND_TOPMOST,
+                    (int)Math.Round(newX), _resizeAnimY, 0, 0,
+                    Native.SWP_NOSIZE | Native.SWP_NOACTIVATE);
+            }
+        }
+
+        if (allDone)
+        {
+            Native.KillTimer(_hwnd, (IntPtr)ResizeAnimTimerId);
+            _resizeAnimX = null;
+            _resizeTargetX = null;
+
+            // Broadcast so all widgets re-render at their final positions
+            WidgetOrderManager.BroadcastReposition();
+        }
+    }
+
     private IntPtr WndProc(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam)
     {
         // Check for reposition broadcast
         if (msg == _repositionMsg && _repositionMsg != 0)
         {
-            PositionOverTaskbar();
-            RenderToScreen();
+            // Skip if we're driving a resize animation (we handle positioning)
+            if (_resizeAnimX == null)
+            {
+                PositionOverTaskbar();
+                RenderToScreen();
+            }
             return IntPtr.Zero;
         }
 
@@ -391,6 +536,11 @@ public sealed class Widget : IDisposable
             case Native.WM_TIMER:
             {
                 int timerId = (int)wParam;
+                if (timerId == ResizeAnimTimerId)
+                {
+                    OnResizeAnimTick();
+                    return IntPtr.Zero;
+                }
                 if (timerId == TooltipManager.ShowTimerId)
                 {
                     _tooltipManager.OnShowTimer(_hwnd, _dpiScale);
@@ -427,15 +577,14 @@ public sealed class Widget : IDisposable
 
                 if (_width != oldWidth)
                 {
-                    // Width changed — reposition all widgets atomically
-                    // so neighbors move out of the way.
-                    // Pass our name + new width so RepositionAll uses the correct size
-                    // (the on-screen window rect still has the old width).
-                    WidgetOrderManager.RepositionAll(_name, _width);
+                    // Width changed — smoothly animate all widgets to new positions
+                    StartResizeAnimation();
                 }
-
-                // Always reposition this widget (screen coordinates)
-                PositionOverTaskbar();
+                else
+                {
+                    // No size change — just reposition normally
+                    PositionOverTaskbar();
+                }
 
                 RenderToScreen();
                 return IntPtr.Zero;
