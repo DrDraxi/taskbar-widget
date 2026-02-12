@@ -67,11 +67,25 @@ public static class WidgetOrderManager
     }
 
     /// <summary>
-    /// Save a new order.
+    /// Save a new order. Preserves non-running widgets from the existing
+    /// order file so they aren't lost when only a subset of widgets is active.
     /// </summary>
     public static void SaveOrder(string[] names)
     {
-        WriteOrder(new List<string>(names));
+        var activeSet = new HashSet<string>(names);
+        var existing = ReadOrder();
+
+        // Build merged list: start with the new active order,
+        // then append any previously registered widgets that aren't running
+        // (preserving their relative order from the old file).
+        var merged = new List<string>(names);
+        foreach (var name in existing)
+        {
+            if (!activeSet.Contains(name))
+                merged.Add(name);
+        }
+
+        WriteOrder(merged);
     }
 
     /// <summary>
