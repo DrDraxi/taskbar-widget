@@ -220,7 +220,11 @@ public sealed class Widget : IDisposable
         if (newWidth > 0 && newWidth != _width)
         {
             _width = newWidth;
-            _helper?.ResizePixels(_width);
+            // Resize only — don't call _helper.ResizePixels() which invokes
+            // UpdatePosition() using taskbar-relative coordinates.
+            // Widget handles its own positioning via PositionOverTaskbar().
+            Native.SetWindowPos(_hwnd, IntPtr.Zero, 0, 0, _width, _height,
+                Native.SWP_NOMOVE | Native.SWP_NOZORDER | Native.SWP_NOACTIVATE);
         }
     }
 
@@ -432,10 +436,9 @@ public sealed class Widget : IDisposable
                     // so neighbors move out of the way
                     WidgetOrderManager.RepositionAll();
                 }
-                else
-                {
-                    PositionOverTaskbar();
-                }
+
+                // Always reposition this widget (screen coordinates)
+                PositionOverTaskbar();
 
                 RenderToScreen();
                 return IntPtr.Zero;
