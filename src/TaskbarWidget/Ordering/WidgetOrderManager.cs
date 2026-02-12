@@ -173,7 +173,7 @@ public static class WidgetOrderManager
                 return new List<string>();
 
             var json = File.ReadAllText(OrderFilePath);
-            return JsonSerializer.Deserialize<List<string>>(json) ?? new List<string>();
+            return JsonSerializer.Deserialize(json, OrderJsonContext.Default.ListString) ?? new List<string>();
         }
         catch
         {
@@ -189,7 +189,7 @@ public static class WidgetOrderManager
             if (!Directory.Exists(dir))
                 Directory.CreateDirectory(dir);
 
-            var json = JsonSerializer.Serialize(order, new JsonSerializerOptions { WriteIndented = true });
+            var json = JsonSerializer.Serialize(order, OrderJsonContext.Default.ListString);
             // Write to temp file then move for atomicity
             var temp = OrderFilePath + ".tmp";
             File.WriteAllText(temp, json);
