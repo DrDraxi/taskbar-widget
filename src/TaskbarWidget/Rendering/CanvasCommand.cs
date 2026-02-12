@@ -49,3 +49,13 @@ internal sealed class DrawFilledRectCommand : CanvasCommand
     public int H { get; init; }
     public Color Color { get; init; }
 }
+
+internal sealed class DrawFilledRoundedRectCommand : CanvasCommand
+{
+    public int X { get; init; }
+    public int Y { get; init; }
+    public int W { get; init; }
+    public int H { get; init; }
+    public int Radius { get; init; }
+    public Color Color { get; init; }
+}

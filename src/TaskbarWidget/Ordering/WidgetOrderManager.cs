@@ -87,7 +87,9 @@ public static class WidgetOrderManager
     /// Avoids chicken-and-egg issues where individual PositionOverTaskbar calls
     /// collide with neighbors that haven't moved yet.
     /// </summary>
-    public static void RepositionAll()
+    /// <param name="callerName">Name of the widget whose size just changed (optional).</param>
+    /// <param name="callerWidth">The new width the caller will have (used instead of stale on-screen size).</param>
+    public static void RepositionAll(string? callerName = null, int callerWidth = 0)
     {
         var order = ReadOrder();
         if (order.Count == 0) return;
@@ -103,7 +105,12 @@ public static class WidgetOrderManager
 
             string name = className.Substring("TaskbarWidget_".Length);
             Native.GetWindowRect(hwnd, out var rect);
-            windows[name] = (hwnd, rect.Width);
+            // Use caller-provided width if this is the widget that just changed size,
+            // since its on-screen rect is still the old size.
+            int width = (callerName != null && name == callerName && callerWidth > 0)
+                ? callerWidth
+                : rect.Width;
+            windows[name] = (hwnd, width);
 
             return true;
         }, IntPtr.Zero);

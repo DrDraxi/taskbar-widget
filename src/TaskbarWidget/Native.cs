@@ -31,6 +31,7 @@ public static class Native
     public const uint WM_LBUTTONDBLCLK = 0x0203;
     public const uint WM_RBUTTONDOWN = 0x0204;
     public const uint WM_RBUTTONUP = 0x0205;
+    public const uint WM_RBUTTONDBLCLK = 0x0206;
     public const uint WM_TIMER = 0x0113;
     public const uint WM_SETTINGCHANGE = 0x001A;
     public const uint WM_DROPFILES = 0x0233;

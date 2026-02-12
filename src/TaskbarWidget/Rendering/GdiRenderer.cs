@@ -184,8 +184,8 @@ internal static class GdiRenderer
         Native.SelectObject(hdc, oldFont);
         Native.DeleteObject(hFont);
 
-        // Alpha fixup: GDI zeroes alpha. Detect coverage from white text and apply target color.
-        bool isDark = ThemeDetector.IsDarkMode;
+        // Alpha fixup: GDI zeroes alpha on glyph pixels only. Use alpha==0 to
+        // identify GDI-drawn pixels vs pre-existing background (which has alpha>0).
         int x0 = Math.Max(0, node.AbsX);
         int y0 = Math.Max(0, node.AbsY);
         int x1 = Math.Min(stride, node.AbsX + node.Width);
@@ -197,12 +197,17 @@ internal static class GdiRenderer
             {
                 int idx = y * stride + x;
                 uint pixel = px[idx];
+                byte existingAlpha = (byte)(pixel >> 24);
+
+                // Only process pixels where GDI zeroed the alpha (glyph pixels)
+                if (existingAlpha != 0) continue;
+
                 byte b = (byte)(pixel & 0xFF);
                 byte g = (byte)((pixel >> 8) & 0xFF);
                 byte r = (byte)((pixel >> 16) & 0xFF);
 
                 byte coverage = Math.Max(r, Math.Max(g, b));
-                if (coverage > 24) // threshold past hover bg
+                if (coverage > 0)
                 {
                     // Apply text color with coverage as alpha
                     uint a = coverage;
@@ -222,20 +227,55 @@ internal static class GdiRenderer
 
         int dstX = node.AbsX;
         int dstY = node.AbsY;
+        int dstW = node.Width;
+        int dstH = node.Height;
 
-        for (int y = 0; y < node.Height && y < img.Height; y++)
+        for (int y = 0; y < dstH; y++)
         {
             int py = dstY + y;
             if (py < 0 || py >= height) continue;
-            for (int x = 0; x < node.Width && x < img.Width; x++)
+            for (int x = 0; x < dstW; x++)
             {
                 int px2 = dstX + x;
                 if (px2 < 0 || px2 >= stride) continue;
 
-                // Scale: if node size != image size, use nearest neighbor
-                int srcX = img.Width == node.Width ? x : x * img.Width / node.Width;
-                int srcY = img.Height == node.Height ? y : y * img.Height / node.Height;
-                uint srcPixel = img.Pixels[srcY * img.Width + srcX];
+                uint srcPixel;
+                if (img.Width == dstW && img.Height == dstH)
+                {
+                    srcPixel = img.Pixels[y * img.Width + x];
+                }
+                else
+                {
+                    // Box-filter: average all source pixels that map to this dest pixel
+                    int sx0 = x * img.Width / dstW;
+                    int sx1 = (x + 1) * img.Width / dstW;
+                    int sy0 = y * img.Height / dstH;
+                    int sy1 = (y + 1) * img.Height / dstH;
+                    if (sx1 == sx0) sx1 = sx0 + 1;
+                    if (sy1 == sy0) sy1 = sy0 + 1;
+                    sx1 = Math.Min(sx1, img.Width);
+                    sy1 = Math.Min(sy1, img.Height);
+
+                    uint sumA = 0, sumR = 0, sumG = 0, sumB = 0;
+                    int count = 0;
+                    for (int sy = sy0; sy < sy1; sy++)
+                    {
+                        for (int sx = sx0; sx < sx1; sx++)
+                        {
+                            uint p = img.Pixels[sy * img.Width + sx];
+                            sumA += p >> 24;
+                            sumR += (p >> 16) & 0xFF;
+                            sumG += (p >> 8) & 0xFF;
+                            sumB += p & 0xFF;
+                            count++;
+                        }
+                    }
+                    uint avgA = sumA / (uint)count;
+                    uint avgR = sumR / (uint)count;
+                    uint avgG = sumG / (uint)count;
+                    uint avgB = sumB / (uint)count;
+                    srcPixel = (avgA << 24) | (avgR << 16) | (avgG << 8) | avgB;
+                }
 
                 if ((srcPixel >> 24) == 0) continue;
                 BlendPixel(px, py * stride + px2, srcPixel);
@@ -268,6 +308,9 @@ internal static class GdiRenderer
                 case DrawFilledRectCommand fr:
                     CanvasDrawFilledRect(px, stride, height, ox, oy, cw, ch, dpiScale, fr);
                     break;
+                case DrawFilledRoundedRectCommand frr:
+                    CanvasDrawFilledRoundedRect(px, stride, height, ox, oy, cw, ch, dpiScale, frr);
+                    break;
                 case DrawRectCommand r:
                     CanvasDrawRect(px, stride, height, ox, oy, cw, ch, dpiScale, r);
                     break;
@@ -283,6 +326,16 @@ internal static class GdiRenderer
             BlendPixel(px, y * stride + x, color);
     }
 
+    private static uint ApplyAlpha(Color color, double alpha)
+    {
+        byte a = (byte)Math.Clamp((int)(color.A * alpha), 0, 255);
+        if (a == 0) return 0;
+        byte r = (byte)(color.R * a / 255);
+        byte g = (byte)(color.G * a / 255);
+        byte b = (byte)(color.B * a / 255);
+        return ((uint)a << 24) | ((uint)r << 16) | ((uint)g << 8) | b;
+    }
+
     private static unsafe void CanvasDrawLine(uint* px, int stride, int height, int ox, int oy, int cw, int ch, double dpi, DrawLineCommand cmd)
     {
         int x0 = ox + (int)(cmd.X1 * dpi);
@@ -290,24 +343,58 @@ internal static class GdiRenderer
         int x1 = ox + (int)(cmd.X2 * dpi);
         int y1 = oy + (int)(cmd.Y2 * dpi);
         int thick = Math.Max(1, (int)(cmd.Thickness * dpi));
-        uint color = cmd.Color.ToPremultiplied();
-
-        // Bresenham with thickness
-        int dx = Math.Abs(x1 - x0), dy = Math.Abs(y1 - y0);
-        int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
-        int err = dx - dy;
         int halfT = thick / 2;
 
-        while (true)
-        {
-            for (int ty = -halfT; ty <= halfT; ty++)
-                for (int tx = -halfT; tx <= halfT; tx++)
-                    SetPixelSafe(px, stride, height, x0 + tx, y0 + ty, color);
+        // Xiaolin Wu's line algorithm with thickness
+        bool steep = Math.Abs(y1 - y0) > Math.Abs(x1 - x0);
+        if (steep) { (x0, y0) = (y0, x0); (x1, y1) = (y1, x1); }
+        if (x0 > x1) { (x0, x1) = (x1, x0); (y0, y1) = (y1, y0); }
 
-            if (x0 == x1 && y0 == y1) break;
-            int e2 = 2 * err;
-            if (e2 > -dy) { err -= dy; x0 += sx; }
-            if (e2 < dx) { err += dx; y0 += sy; }
+        int dx = x1 - x0;
+        int dy = y1 - y0;
+        double gradient = dx == 0 ? 1.0 : (double)dy / dx;
+
+        // First endpoint
+        double xEnd = x0;
+        double yEnd = y0 + gradient * (xEnd - x0);
+        double xGap = 1.0 - ((x0 + 0.5) - Math.Floor(x0 + 0.5));
+        int xpxl1 = (int)xEnd;
+        int ypxl1 = (int)Math.Floor(yEnd);
+
+        void PlotThick(int px2, int py2, double brightness)
+        {
+            uint c = ApplyAlpha(cmd.Color, brightness);
+            if (c == 0) return;
+            for (int t = -halfT; t <= halfT; t++)
+            {
+                if (steep)
+                    SetPixelSafe(px, stride, height, py2 + t, px2, c);
+                else
+                    SetPixelSafe(px, stride, height, px2, py2 + t, c);
+            }
+        }
+
+        PlotThick(xpxl1, ypxl1, (1.0 - (yEnd - Math.Floor(yEnd))) * xGap);
+        PlotThick(xpxl1, ypxl1 + 1, (yEnd - Math.Floor(yEnd)) * xGap);
+        double intery = yEnd + gradient;
+
+        // Second endpoint
+        xEnd = x1;
+        yEnd = y1 + gradient * (xEnd - x1);
+        xGap = (x1 + 0.5) - Math.Floor(x1 + 0.5);
+        int xpxl2 = (int)xEnd;
+        int ypxl2 = (int)Math.Floor(yEnd);
+        PlotThick(xpxl2, ypxl2, (1.0 - (yEnd - Math.Floor(yEnd))) * xGap);
+        PlotThick(xpxl2, ypxl2 + 1, (yEnd - Math.Floor(yEnd)) * xGap);
+
+        // Main loop
+        for (int x = xpxl1 + 1; x < xpxl2; x++)
+        {
+            int ipart = (int)Math.Floor(intery);
+            double fpart = intery - ipart;
+            PlotThick(x, ipart, 1.0 - fpart);
+            PlotThick(x, ipart + 1, fpart);
+            intery += gradient;
         }
     }
 
@@ -319,9 +406,7 @@ internal static class GdiRenderer
         uint color = cmd.Color.ToPremultiplied();
 
         // Midpoint circle algorithm
-        int x = r, y = 0;
-        int d = 1 - r;
-
+        int x = r, y = 0, d = 1 - r;
         while (x >= y)
         {
             SetPixelSafe(px, stride, height, cx + x, cy + y, color);
@@ -333,13 +418,8 @@ internal static class GdiRenderer
             SetPixelSafe(px, stride, height, cx + y, cy - x, color);
             SetPixelSafe(px, stride, height, cx - y, cy - x, color);
             y++;
-            if (d <= 0)
-                d += 2 * y + 1;
-            else
-            {
-                x--;
-                d += 2 * (y - x) + 1;
-            }
+            if (d <= 0) d += 2 * y + 1;
+            else { x--; d += 2 * (y - x) + 1; }
         }
     }
 
@@ -367,6 +447,21 @@ internal static class GdiRenderer
         for (int y = 0; y < rh; y++)
             for (int x = 0; x < rw; x++)
                 SetPixelSafe(px, stride, height, rx + x, ry + y, color);
+    }
+
+    private static unsafe void CanvasDrawFilledRoundedRect(uint* px, int stride, int height, int ox, int oy, int cw, int ch, double dpi, DrawFilledRoundedRectCommand cmd)
+    {
+        int rx = ox + (int)(cmd.X * dpi);
+        int ry = oy + (int)(cmd.Y * dpi);
+        int rw = (int)(cmd.W * dpi);
+        int rh = (int)(cmd.H * dpi);
+        int cr = (int)(cmd.Radius * dpi);
+        uint color = cmd.Color.ToPremultiplied();
+
+        for (int y = 0; y < rh; y++)
+            for (int x = 0; x < rw; x++)
+                if (IsInsideRoundedRect(x, y, 0, 0, rw, rh, cr))
+                    SetPixelSafe(px, stride, height, rx + x, ry + y, color);
     }
 
     private static unsafe void CanvasDrawRect(uint* px, int stride, int height, int ox, int oy, int cw, int ch, double dpi, DrawRectCommand cmd)

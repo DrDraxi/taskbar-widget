@@ -215,17 +215,11 @@ public sealed class Widget : IDisposable
         _rootNode = root;
         _mouseTracker.SetRoot(root, _dpiScale);
 
-        // Resize widget window if content width changed
+        // Track new width — actual resize deferred to PositionOverTaskbar()
+        // so resize + reposition happen atomically in one SetWindowPos call.
         int newWidth = root.Width;
-        if (newWidth > 0 && newWidth != _width)
-        {
+        if (newWidth > 0)
             _width = newWidth;
-            // Resize only — don't call _helper.ResizePixels() which invokes
-            // UpdatePosition() using taskbar-relative coordinates.
-            // Widget handles its own positioning via PositionOverTaskbar().
-            Native.SetWindowPos(_hwnd, IntPtr.Zero, 0, 0, _width, _height,
-                Native.SWP_NOMOVE | Native.SWP_NOZORDER | Native.SWP_NOACTIVATE);
-        }
     }
 
     private void RenderToScreen()
@@ -341,6 +335,7 @@ public sealed class Widget : IDisposable
             }
 
             case Native.WM_RBUTTONDOWN:
+            case Native.WM_RBUTTONDBLCLK:
             {
                 int x = (short)(lParam.ToInt64() & 0xFFFF);
                 int y = (short)((lParam.ToInt64() >> 16) & 0xFFFF);
@@ -433,8 +428,10 @@ public sealed class Widget : IDisposable
                 if (_width != oldWidth)
                 {
                     // Width changed — reposition all widgets atomically
-                    // so neighbors move out of the way
-                    WidgetOrderManager.RepositionAll();
+                    // so neighbors move out of the way.
+                    // Pass our name + new width so RepositionAll uses the correct size
+                    // (the on-screen window rect still has the old width).
+                    WidgetOrderManager.RepositionAll(_name, _width);
                 }
 
                 // Always reposition this widget (screen coordinates)

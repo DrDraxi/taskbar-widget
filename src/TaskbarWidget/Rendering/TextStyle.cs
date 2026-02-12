@@ -6,7 +6,7 @@ namespace TaskbarWidget.Rendering;
 public sealed class TextStyle
 {
     public string FontFamily { get; init; } = "Segoe UI";
-    public int FontSizeDip { get; init; } = 12;
+    public int FontSizeDip { get; init; } = 13;
     public int FontWeight { get; init; } = 400;
     public Color? Color { get; init; }
 

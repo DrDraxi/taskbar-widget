@@ -88,6 +88,11 @@ public sealed class PanelContext
     public void Background(Color color) => Node.Background = color;
     public void HoverBackground(Color color) => Node.HoverBackground = color;
     public void CornerRadius(int radius) => Node.CornerRadius = radius;
+    public void Size(int widthDip, int heightDip)
+    {
+        Node.RequestedWidthDip = widthDip;
+        Node.RequestedHeightDip = heightDip;
+    }
 
     public void OnFileDrop(Action<string[]> handler) => Node.OnFileDrop = handler;
     public void OnTextDrop(Action<string> handler) => Node.OnTextDrop = handler;

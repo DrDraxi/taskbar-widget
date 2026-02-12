@@ -32,4 +32,9 @@ public sealed class CanvasContext
     {
         Commands.Add(new DrawFilledRectCommand { X = x, Y = y, W = w, H = h, Color = color });
     }
+
+    public void DrawFilledRoundedRect(int x, int y, int w, int h, int radius, Color color)
+    {
+        Commands.Add(new DrawFilledRoundedRectCommand { X = x, Y = y, W = w, H = h, Radius = radius, Color = color });
+    }
 }
