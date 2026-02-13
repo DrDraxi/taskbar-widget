@@ -247,14 +247,25 @@ public sealed class Widget : IDisposable
         if (_rootNode == null || _hwnd == IntPtr.Zero) return;
 
         GdiRenderer.HoverOverlay? hover = null;
-        if (_isHovering)
+        if (_isHovering && _mouseTracker.HoveredPanel != null)
         {
             var theme = ThemeDetector.CurrentTheme;
+            int marginLeft = HoverMarginLeft;
+            int marginRight = HoverMarginRight;
+
+            // Target overlay to the hovered panel when it opts into individual hover
+            var panel = _mouseTracker.HoveredPanel;
+            if (panel.HoverBackground != null)
+            {
+                marginLeft = panel.AbsX;
+                marginRight = _width - (panel.AbsX + panel.Width);
+            }
+
             hover = new GdiRenderer.HoverOverlay
             {
-                MarginLeft = HoverMarginLeft,
+                MarginLeft = marginLeft,
                 MarginTop = HoverMarginTop,
-                MarginRight = HoverMarginRight,
+                MarginRight = marginRight,
                 MarginBottom = HoverMarginBottom,
                 CornerRadius = HoverCornerRadius,
                 Color = theme.HoverBackground
@@ -492,6 +503,10 @@ public sealed class Widget : IDisposable
                 if (!wasHovering || panelChanged)
                 {
                     RenderToScreen();
+
+                    // Hide tooltip when switching panels so it re-renders with new content
+                    if (panelChanged)
+                        _tooltipManager.Hide(_hwnd);
 
                     // Tooltip handling
                     var (panelTitle, panelBody) = _mouseTracker.GetHoveredTooltip();
