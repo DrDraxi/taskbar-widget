@@ -30,6 +30,10 @@ public sealed class Widget : IDisposable
     private const double ResizeAnimLerp = 0.25;
     private const double ResizeAnimSnap = 0.5;
 
+    // Fullscreen detection constants
+    private const int FullscreenCheckTimerId = 9997;
+    private const int FullscreenCheckIntervalMs = 500;
+
     private readonly string _name;
     private readonly Action<RenderContext> _render;
     private readonly WidgetOptions _options;
@@ -50,6 +54,7 @@ public sealed class Widget : IDisposable
     private int _height;
     private double _dpiScale = 1.0;
     private bool _isHovering;
+    private bool _hiddenForFullscreen;
     private bool _disposed;
     private uint _repositionMsg;
 
@@ -127,6 +132,9 @@ public sealed class Widget : IDisposable
         // Position and show
         PositionOverTaskbar();
         _helper.Show();
+
+        // Start fullscreen detection
+        Native.SetTimer(_hwnd, (IntPtr)FullscreenCheckTimerId, FullscreenCheckIntervalMs, IntPtr.Zero);
 
         // Final render at correct screen position
         RenderToScreen();
@@ -403,6 +411,48 @@ public sealed class Widget : IDisposable
         }
     }
 
+    private void CheckFullscreen()
+    {
+        bool fullscreen = IsFullscreenAppOnWidgetMonitor();
+
+        if (fullscreen && !_hiddenForFullscreen)
+        {
+            _hiddenForFullscreen = true;
+            _tooltipManager.Hide(_hwnd);
+            Native.ShowWindow(_hwnd, Native.SW_HIDE);
+        }
+        else if (!fullscreen && _hiddenForFullscreen)
+        {
+            _hiddenForFullscreen = false;
+            Native.ShowWindow(_hwnd, Native.SW_SHOW);
+            PositionOverTaskbar();
+            RenderToScreen();
+        }
+    }
+
+    private bool IsFullscreenAppOnWidgetMonitor()
+    {
+        var fgWnd = Native.GetForegroundWindow();
+        if (fgWnd == IntPtr.Zero) return false;
+
+        // Ignore desktop and shell windows
+        if (fgWnd == Native.GetDesktopWindow()) return false;
+        if (fgWnd == Native.GetShellWindow()) return false;
+
+        // Only care about fullscreen on the same monitor as the widget
+        var widgetMonitor = Native.MonitorFromWindow(_hwnd, Native.MONITOR_DEFAULTTONEAREST);
+        var fgMonitor = Native.MonitorFromWindow(fgWnd, Native.MONITOR_DEFAULTTONEAREST);
+        if (widgetMonitor != fgMonitor) return false;
+
+        // Check if the foreground window covers the entire monitor
+        Native.GetWindowRect(fgWnd, out var fgRect);
+        var mi = new Native.MONITORINFO { cbSize = Marshal.SizeOf<Native.MONITORINFO>() };
+        Native.GetMonitorInfoW(widgetMonitor, ref mi);
+
+        return fgRect.Left <= mi.rcMonitor.Left && fgRect.Top <= mi.rcMonitor.Top &&
+               fgRect.Right >= mi.rcMonitor.Right && fgRect.Bottom >= mi.rcMonitor.Bottom;
+    }
+
     private IntPtr WndProc(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam)
     {
         // Check for reposition broadcast
@@ -536,6 +586,11 @@ public sealed class Widget : IDisposable
             case Native.WM_TIMER:
             {
                 int timerId = (int)wParam;
+                if (timerId == FullscreenCheckTimerId)
+                {
+                    CheckFullscreen();
+                    return IntPtr.Zero;
+                }
                 if (timerId == ResizeAnimTimerId)
                 {
                     OnResizeAnimTick();
@@ -598,6 +653,9 @@ public sealed class Widget : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+
+        if (_hwnd != IntPtr.Zero)
+            Native.KillTimer(_hwnd, (IntPtr)FullscreenCheckTimerId);
 
         _timerManager.Dispose();
         _tooltipManager.Dispose();

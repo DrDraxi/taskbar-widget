@@ -480,6 +480,19 @@ public static class Native
 
     #endregion
 
+    #region Fullscreen Detection
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetDesktopWindow();
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetShellWindow();
+
+    #endregion
+
     #region Helper Methods
 
     public static IntPtr FindTaskbar() => FindWindowW("Shell_TrayWnd", null);
