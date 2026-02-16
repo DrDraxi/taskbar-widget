@@ -34,6 +34,7 @@ public static class Native
     public const uint WM_RBUTTONDBLCLK = 0x0206;
     public const uint WM_TIMER = 0x0113;
     public const uint WM_SETTINGCHANGE = 0x001A;
+    public const uint WM_DISPLAYCHANGE = 0x007E;
     public const uint WM_DROPFILES = 0x0233;
     public const uint WM_SETCURSOR = 0x0020;
     public const uint WM_CAPTURECHANGED = 0x0215;

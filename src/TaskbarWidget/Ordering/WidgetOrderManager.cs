@@ -129,7 +129,7 @@ public static class WidgetOrderManager
             return true;
         }, IntPtr.Zero);
 
-        if (windows.Count < 2) return;
+        if (windows.Count == 0) return;
 
         var taskbar = Native.FindTaskbar();
         if (taskbar == IntPtr.Zero) return;

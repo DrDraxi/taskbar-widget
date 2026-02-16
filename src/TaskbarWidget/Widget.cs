@@ -422,6 +422,35 @@ public sealed class Widget : IDisposable
         }
     }
 
+    /// <summary>
+    /// Detects if the widget's on-screen position has drifted from
+    /// its expected slot (e.g. tray area resized, resolution changed).
+    /// Called on a periodic timer so the widget self-corrects quickly.
+    /// </summary>
+    private void CheckPositionDrift()
+    {
+        if (_hiddenForFullscreen || _hwnd == IntPtr.Zero || _helper == null) return;
+        if (_resizeAnimX != null) return; // resize animation owns positioning
+
+        Native.GetWindowRect(_hwnd, out var currentRect);
+
+        var taskbarHandle = _helper.TaskbarHandle;
+        Native.GetWindowRect(taskbarHandle, out var taskbarRect);
+
+        int orderIndex = WidgetOrderManager.GetOrderIndex(_name);
+        var slotFinder = new TaskbarSlotFinder();
+        var slot = slotFinder.FindSlot(_width, _hwnd, _options.Margin, orderIndex);
+
+        int expectedX = taskbarRect.Left + slot.X;
+        int expectedY = taskbarRect.Top + slot.Y;
+
+        if (currentRect.Left != expectedX || currentRect.Top != expectedY)
+        {
+            PositionOverTaskbar();
+            RenderToScreen();
+        }
+    }
+
     private void CheckFullscreen()
     {
         bool fullscreen = IsFullscreenAppOnWidgetMonitor();
@@ -529,6 +558,7 @@ public sealed class Widget : IDisposable
             }
 
             case Native.WM_LBUTTONDOWN:
+            case Native.WM_LBUTTONDBLCLK:
             {
                 int x = (short)(lParam.ToInt64() & 0xFFFF);
                 int y = (short)((lParam.ToInt64() >> 16) & 0xFFFF);
@@ -564,14 +594,6 @@ public sealed class Widget : IDisposable
                 return IntPtr.Zero;
             }
 
-            case Native.WM_LBUTTONDBLCLK:
-            {
-                int x = (short)(lParam.ToInt64() & 0xFFFF);
-                int y = (short)((lParam.ToInt64() >> 16) & 0xFFFF);
-                _mouseTracker.OnDoubleClick(x, y);
-                return IntPtr.Zero;
-            }
-
             case Native.WM_SETCURSOR:
             {
                 if (_dragManager.IsDragging)
@@ -604,6 +626,7 @@ public sealed class Widget : IDisposable
                 if (timerId == FullscreenCheckTimerId)
                 {
                     CheckFullscreen();
+                    CheckPositionDrift();
                     return IntPtr.Zero;
                 }
                 if (timerId == ResizeAnimTimerId)
@@ -630,6 +653,14 @@ public sealed class Widget : IDisposable
             {
                 ThemeDetector.OnSettingChange();
                 RebuildAndRender();
+                PositionOverTaskbar();
+                RenderToScreen();
+                return IntPtr.Zero;
+            }
+
+            case Native.WM_DISPLAYCHANGE:
+            {
+                PositionOverTaskbar();
                 RenderToScreen();
                 return IntPtr.Zero;
             }
