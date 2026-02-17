@@ -20,7 +20,7 @@ internal static class HitTester
 
     private static void FindPanelRecursive(LayoutNode node, int x, int y, double dpiScale, ref LayoutNode? hit)
     {
-        if (node.Type == LayoutNodeType.Panel)
+        if (node.Type == LayoutNodeType.Panel || node.Type == LayoutNodeType.Root)
         {
             int cr = (int)(node.CornerRadius * dpiScale);
             if (cr > 0)
