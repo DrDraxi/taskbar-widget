@@ -247,14 +247,17 @@ public sealed class Widget : IDisposable
         if (_rootNode == null || _hwnd == IntPtr.Zero) return;
 
         GdiRenderer.HoverOverlay? hover = null;
-        if (_isHovering && _mouseTracker.HoveredPanel != null)
+        var hoveredPanel = _mouseTracker.HoveredPanel;
+        bool showHover = _isHovering && hoveredPanel != null
+            && (_options.RootHover || hoveredPanel.Type != LayoutNodeType.Root);
+        if (showHover)
         {
             var theme = ThemeDetector.CurrentTheme;
             int marginLeft = HoverMarginLeft;
             int marginRight = HoverMarginRight;
 
             // Target overlay to the hovered panel when it opts into individual hover
-            var panel = _mouseTracker.HoveredPanel;
+            var panel = hoveredPanel!;
             if (panel.HoverBackground != null)
             {
                 marginLeft = panel.AbsX;
