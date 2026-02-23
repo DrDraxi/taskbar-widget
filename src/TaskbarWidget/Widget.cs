@@ -226,8 +226,9 @@ public sealed class Widget : IDisposable
         // Force root height to taskbar height
         root.Height = _height;
 
-        // Add padding so content fits inside the hover overlay with breathing room
-        root.Width += HoverMarginLeft + HoverMarginRight + ContentPaddingLeft + ContentPaddingRight;
+        // Add padding so content fits inside the hover overlay with breathing room (scaled to DPI)
+        int hPad = (int)Math.Ceiling((HoverMarginLeft + HoverMarginRight + ContentPaddingLeft + ContentPaddingRight) * _dpiScale);
+        root.Width += hPad;
 
         // Arrange
         LayoutEngine.Arrange(root);
@@ -253,8 +254,13 @@ public sealed class Widget : IDisposable
         if (showHover)
         {
             var theme = ThemeDetector.CurrentTheme;
-            int marginLeft = HoverMarginLeft;
-            int marginRight = HoverMarginRight;
+            int scaledMarginLeft = (int)Math.Ceiling(HoverMarginLeft * _dpiScale);
+            int scaledMarginRight = (int)Math.Ceiling(HoverMarginRight * _dpiScale);
+            int scaledMarginTop = (int)Math.Ceiling(HoverMarginTop * _dpiScale);
+            int scaledMarginBottom = (int)Math.Ceiling(HoverMarginBottom * _dpiScale);
+
+            int marginLeft = scaledMarginLeft;
+            int marginRight = scaledMarginRight;
 
             // Target overlay to the hovered panel when it opts into individual hover
             var panel = hoveredPanel!;
@@ -267,9 +273,9 @@ public sealed class Widget : IDisposable
             hover = new GdiRenderer.HoverOverlay
             {
                 MarginLeft = marginLeft,
-                MarginTop = HoverMarginTop,
+                MarginTop = scaledMarginTop,
                 MarginRight = marginRight,
-                MarginBottom = HoverMarginBottom,
+                MarginBottom = scaledMarginBottom,
                 CornerRadius = HoverCornerRadius,
                 Color = theme.HoverBackground
             };
@@ -288,6 +294,11 @@ public sealed class Widget : IDisposable
         int orderIndex = WidgetOrderManager.GetOrderIndex(_name);
         var slotFinder = new TaskbarSlotFinder();
         var slot = slotFinder.FindSlot(_width, _hwnd, _options.Margin, orderIndex, _options.Log);
+
+        // Sync height from current taskbar bounds (may change with DPI)
+        int taskbarHeight = slotFinder.TaskbarBounds.Height;
+        if (taskbarHeight > 0 && taskbarHeight != _height)
+            _height = taskbarHeight;
 
         int screenX = taskbarRect.Left + slot.X;
         int screenY = taskbarRect.Top + slot.Y;
@@ -435,6 +446,14 @@ public sealed class Widget : IDisposable
         if (_hiddenForFullscreen || _hwnd == IntPtr.Zero || _helper == null) return;
         if (_resizeAnimX != null) return; // resize animation owns positioning
 
+        // Safety net: catch DPI changes that weren't delivered via WM_DPICHANGED
+        var freshDpi = RefreshDpiFromTaskbar();
+        if (Math.Abs(freshDpi - _dpiScale) > 0.001)
+        {
+            HandleDpiChange(freshDpi);
+            return; // HandleDpiChange already repositions and re-renders
+        }
+
         Native.GetWindowRect(_hwnd, out var currentRect);
 
         var taskbarHandle = _helper.TaskbarHandle;
@@ -494,6 +513,27 @@ public sealed class Widget : IDisposable
 
         return fgRect.Left <= mi.rcMonitor.Left && fgRect.Top <= mi.rcMonitor.Top &&
                fgRect.Right >= mi.rcMonitor.Right && fgRect.Bottom >= mi.rcMonitor.Bottom;
+    }
+
+    private void HandleDpiChange(double newDpiScale)
+    {
+        if (Math.Abs(newDpiScale - _dpiScale) < 0.001) return;
+
+        _options.Log?.Invoke($"DPI changed: {_dpiScale:F2} → {newDpiScale:F2}");
+        _dpiScale = newDpiScale;
+
+        if (_helper != null)
+            _height = _helper.UpdateDpi(newDpiScale);
+
+        RebuildAndRender();
+        PositionOverTaskbar();
+        RenderToScreen();
+    }
+
+    private double RefreshDpiFromTaskbar()
+    {
+        var taskbar = Native.FindTaskbar();
+        return taskbar != IntPtr.Zero ? Native.GetScaleFactor(taskbar) : _dpiScale;
     }
 
     private IntPtr WndProc(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam)
@@ -652,19 +692,41 @@ public sealed class Widget : IDisposable
                 break;
             }
 
+            case Native.WM_DPICHANGED:
+            {
+                HandleDpiChange(Native.GetDpiScaleFromWParam(wParam));
+                return IntPtr.Zero;
+            }
+
             case Native.WM_SETTINGCHANGE:
             {
                 ThemeDetector.OnSettingChange();
-                RebuildAndRender();
-                PositionOverTaskbar();
-                RenderToScreen();
+                var freshDpi = RefreshDpiFromTaskbar();
+                if (Math.Abs(freshDpi - _dpiScale) > 0.001)
+                {
+                    HandleDpiChange(freshDpi);
+                }
+                else
+                {
+                    RebuildAndRender();
+                    PositionOverTaskbar();
+                    RenderToScreen();
+                }
                 return IntPtr.Zero;
             }
 
             case Native.WM_DISPLAYCHANGE:
             {
-                PositionOverTaskbar();
-                RenderToScreen();
+                var freshDpi = RefreshDpiFromTaskbar();
+                if (Math.Abs(freshDpi - _dpiScale) > 0.001)
+                {
+                    HandleDpiChange(freshDpi);
+                }
+                else
+                {
+                    PositionOverTaskbar();
+                    RenderToScreen();
+                }
                 return IntPtr.Zero;
             }
 

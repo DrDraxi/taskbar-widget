@@ -304,6 +304,20 @@ public sealed class TaskbarInjectionHelper : IDisposable
     }
 
     /// <summary>
+    /// Updates the DPI scale, re-queries taskbar height, and returns the new height.
+    /// </summary>
+    public int UpdateDpi(double newDpiScale)
+    {
+        _dpiScale = newDpiScale;
+
+        _slotFinder = new TaskbarSlotFinder();
+        if (_slotFinder.IsTaskbarFound)
+            _widgetHeight = _slotFinder.TaskbarBounds.Height;
+
+        return _widgetHeight;
+    }
+
+    /// <summary>
     /// Re-inject the window after explorer restart.
     /// </summary>
     public bool Reinject()
@@ -320,6 +334,8 @@ public sealed class TaskbarInjectionHelper : IDisposable
         }
 
         _hwndTaskbar = _slotFinder.TaskbarHandle;
+        _dpiScale = _slotFinder.DpiScale;
+        _widgetHeight = _slotFinder.TaskbarBounds.Height;
 
         if (_hwnd != IntPtr.Zero)
         {

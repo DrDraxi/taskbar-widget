@@ -38,6 +38,7 @@ public static class Native
     public const uint WM_DROPFILES = 0x0233;
     public const uint WM_SETCURSOR = 0x0020;
     public const uint WM_CAPTURECHANGED = 0x0215;
+    public const uint WM_DPICHANGED = 0x02E1;
     public const uint WM_DESTROY = 0x0002;
     public const uint WM_USER = 0x0400;
     public const uint WM_NOTIFY = 0x004E;
@@ -512,6 +513,16 @@ public static class Native
         var sb = new System.Text.StringBuilder(256);
         GetClassNameW(hwnd, sb, sb.Capacity);
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// Extract DPI scale factor from WM_DPICHANGED wParam.
+    /// The new DPI is in the low word of wParam.
+    /// </summary>
+    public static double GetDpiScaleFromWParam(IntPtr wParam)
+    {
+        int newDpi = wParam.ToInt32() & 0xFFFF;
+        return newDpi == 0 ? 1.0 : newDpi / 96.0;
     }
 
     /// <summary>
