@@ -12,8 +12,22 @@ public sealed class WidgetOptions
     /// <summary>Exit the process if another instance of this widget is already running. Default true.</summary>
     public bool SingleInstance { get; init; } = true;
 
-    /// <summary>Items for the widget's right-click / Shift+right-click menu. "Exit" is always appended.</summary>
+    /// <summary>Modifier that makes right-click open the menu even when a right-click handler exists. Default Shift.</summary>
+    public MenuModifier MenuModifier { get; init; } = MenuModifier.Shift;
+
+    /// <summary>Items for the widget's context menu. "Exit" is always appended.</summary>
     public Action<MenuBuilder>? Menu { get; init; }
+}
+
+/// <summary>Which modifier + right-click always opens the widget menu.</summary>
+public enum MenuModifier { Shift, Ctrl, Alt, None }
+
+/// <summary>Current keyboard modifier state (useful inside click handlers).</summary>
+public static class Input
+{
+    public static bool Shift => Native.GetKeyState(Native.VK_SHIFT) < 0;
+    public static bool Ctrl => Native.GetKeyState(Native.VK_CONTROL) < 0;
+    public static bool Alt => Native.GetKeyState(Native.VK_MENU) < 0;
 }
 
 /// <summary>
@@ -678,8 +692,14 @@ public sealed unsafe class Widget : IDisposable
         int idx = HitTest(x);
         var handler = idx >= 0 ? _elements[idx].RightClick : null;
         handler ??= _ui?.RightClick;
-        bool shift = Native.GetKeyState(Native.VK_SHIFT) < 0;
-        if (handler == null || shift) ShowMenu();
+        bool forceMenu = _options.MenuModifier switch
+        {
+            MenuModifier.Shift => Input.Shift,
+            MenuModifier.Ctrl => Input.Ctrl,
+            MenuModifier.Alt => Input.Alt,
+            _ => false,
+        };
+        if (handler == null || forceMenu) ShowMenu();
         else handler();
     }
 

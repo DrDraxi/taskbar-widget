@@ -17,7 +17,7 @@ internal static unsafe class Native
 
     public const int MA_NOACTIVATE = 3;
     public const int PBT_APMRESUMEAUTOMATIC = 0x12;
-    public const int VK_ESCAPE = 0x1B, VK_SHIFT = 0x10;
+    public const int VK_ESCAPE = 0x1B, VK_SHIFT = 0x10, VK_CONTROL = 0x11, VK_MENU = 0x12;
 
     // ── Styles ──────────────────────────────────────────────────────────
     public const uint WS_POPUP = 0x80000000;

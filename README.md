@@ -58,9 +58,9 @@ ui.Custom(40, 8, (g, state) =>
 | `Resumed` | Event raised after the PC wakes from sleep |
 | `Widget.Run()` / `Widget.Exit()` | Message loop / quit |
 
-`WidgetOptions`: `AllowReorder` (default `true`), `SingleInstance` (default `true`), `Menu` (adds items to the right-click menu; **Exit** is always appended).
+`WidgetOptions`: `AllowReorder` (default `true`), `SingleInstance` (default `true`), `MenuModifier` (default `Shift`), `Menu` (adds items to the right-click menu; **Exit** is always appended).
 
-Right-click runs the element's or widget's `OnRightClick` handler if there is one, and opens the menu otherwise. **Shift+right-click** always opens the menu.
+Right-click runs the element's or widget's `OnRightClick` handler if there is one, and opens the menu otherwise. **Shift+right-click** always opens the menu; pick a different modifier with `MenuModifier` (`Ctrl`, `Alt` or `None`). `Input.Shift` / `Input.Ctrl` / `Input.Alt` tell a handler which modifiers are held.
 
 ### `Ui` (build callback)
 

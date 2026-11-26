@@ -47,7 +47,7 @@ public sealed class Ui
     /// <summary>Left-click anywhere not handled by an element.</summary>
     public void OnClick(Action handler) => Click = handler;
 
-    /// <summary>Right-click anywhere not handled by an element. Shift+right-click always opens the widget menu.</summary>
+    /// <summary>Right-click anywhere not handled by an element. Modifier+right-click (<see cref="WidgetOptions.MenuModifier"/>, Shift by default) always opens the widget menu.</summary>
     public void OnRightClick(Action handler) => RightClick = handler;
 
     Element Add(Element e) { Elements.Add(e); return e; }
