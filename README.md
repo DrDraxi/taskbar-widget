@@ -58,7 +58,7 @@ ui.Custom(40, 8, (g, state) =>
 | `Resumed` | Event raised after the PC wakes from sleep |
 | `Widget.Run()` / `Widget.Exit()` | Message loop / quit |
 
-`WidgetOptions`: `AllowReorder` (default `true`), `SingleInstance` (default `true`), `MenuModifier` (default `Shift`), `Menu` (adds items to the right-click menu; **Exit** is always appended).
+`WidgetOptions`: `AllowReorder` (default `true`), `SingleInstance` (default `true`), `MenuModifier` (default `Shift`), `OverflowTop` (DIPs of drawing room above the taskbar, default 0), `Menu` (adds items to the right-click menu; **Exit** is always appended).
 
 Right-click runs the element's or widget's `OnRightClick` handler if there is one, and opens the menu otherwise. **Shift+right-click** always opens the menu; pick a different modifier with `MenuModifier` (`Ctrl`, `Alt` or `None`). `Input.Shift` / `Input.Ctrl` / `Input.Alt` tell a handler which modifiers are held.
 
@@ -78,7 +78,13 @@ Elements return an `Element` you can chain `.OnClick()`, `.OnRightClick()` and `
 
 ### `Graphics` (custom draw)
 
-`FillRect`, `FillRoundRect`, `StrokeRoundRect`, `FillCircle`, `StrokeCircle`, `Line` (round caps), `Image`, `Text`, `MeasureText`, `Theme`, `Scale`.
+`FillRect`, `FillRoundRect`, `StrokeRoundRect`, `FillCircle`, `FillEllipse`, `StrokeCircle`, `Line` (round caps), `Image`, `Text`, `MeasureText`, `Pixels`, `Theme`, `Scale`, `Time`, `RequestFrame()`.
+
+### Animation and custom rendering
+
+- **Frame clock:** call `g.RequestFrame()` from a draw callback while something is animating and the widget repaints at ~60 fps. When nobody asks, it stops, so idle CPU stays at zero. `g.Time` / `Graphics.Now` is the shared animation clock.
+- **`PixelCanvas`:** a premultiplied BGRA buffer you fill yourself (a software renderer, a sparkline…) and draw with `g.Pixels(canvas, x, y)`. Call `Commit()` after changing it; the GPU copy is only refreshed then.
+- **`OverflowTop`:** extends the widget's window above the taskbar so elements can pop out (negative Y). The extra area is click-through except where something is drawn. The hovered element is drawn last, on top of its neighbours.
 
 ### Helpers
 

@@ -134,12 +134,56 @@ public sealed class WidgetImage
         return new WidgetImage(bytes);
     }
 
-    internal byte[] GetPixels(int w, int h)
+    (int, int)? _natural;
+
+    /// <summary>The image's own size in pixels.</summary>
+    public (int Width, int Height) NaturalSize
+    {
+        get
+        {
+            if (_natural == null) { D2D.Decode(_encoded, 1, 1, out var w, out var h); _natural = (w, h); }
+            return _natural.Value;
+        }
+    }
+
+    /// <summary>
+    /// Decodes and resamples the image to exactly <paramref name="w"/>×<paramref name="h"/> premultiplied
+    /// BGRA pixels (4 bytes per pixel, row-major). Results are cached. Must be called on the UI thread.
+    /// </summary>
+    public byte[] GetPixels(int w, int h)
     {
         if (!_pixels.TryGetValue((w, h), out var px))
             _pixels[(w, h)] = px = D2D.Decode(_encoded, w, h, out _, out _);
         return px;
     }
+}
+
+/// <summary>
+/// A raw pixel buffer you render yourself (e.g. a software 3D renderer) and draw with
+/// <see cref="Graphics.Pixels"/>. Pixels are premultiplied 0xAARRGGBB, row-major. Call
+/// <see cref="Commit"/> after changing them; the GPU-side copy is only refreshed then.
+/// </summary>
+public sealed class PixelCanvas
+{
+    public PixelCanvas(int width, int height) => Resize(width, height);
+
+    public int Width { get; private set; }
+    public int Height { get; private set; }
+    public uint[] Pixels { get; private set; } = Array.Empty<uint>();
+    internal int Version { get; private set; }
+
+    /// <summary>Resizes (clearing the contents) if the size differs.</summary>
+    public void Resize(int width, int height)
+    {
+        width = Math.Max(1, width); height = Math.Max(1, height);
+        if (width == Width && height == Height) return;
+        Width = width; Height = height;
+        Pixels = new uint[width * height];
+        Version++;
+    }
+
+    public void Clear() { Array.Clear(Pixels); Version++; }
+    public void Commit() => Version++;
 }
 
 /// <summary>Interaction state handed to custom draw callbacks. Values animate smoothly between 0 and 1.</summary>
@@ -153,6 +197,19 @@ public sealed class Graphics
 {
     internal Surface Surface = null!;
     internal float OriginX, OriginY;
+    internal Action? FrameRequested;
+
+    static readonly long ClockStart = System.Diagnostics.Stopwatch.GetTimestamp();
+
+    /// <summary>Monotonic animation clock in seconds (same clock as <see cref="Time"/>).</summary>
+    public static double Now => System.Diagnostics.Stopwatch.GetElapsedTime(ClockStart).TotalSeconds;
+
+    /// <summary>Current animation time in seconds.</summary>
+    public double Time => Now;
+
+    /// <summary>Ask for another frame (~60 fps). Call it from a draw callback while something is animating;
+    /// when nobody asks, the widget stops repainting (zero idle CPU).</summary>
+    public void RequestFrame() => FrameRequested?.Invoke();
 
     internal Graphics(float scale, Theme theme) { Scale = scale; Theme = theme; }
 
@@ -175,6 +232,13 @@ public sealed class Graphics
         float t = thickness * Scale, i = t / 2;
         Surface.StrokeRoundRect(new RectF(X(x) + i, Y(y) + i, X(x + w) - i, Y(y + h) - i), radius * Scale, c, t);
     }
+
+    public void FillEllipse(float cx, float cy, float rx, float ry, Color c) =>
+        Surface.FillEllipse(X(cx), Y(cy), rx * Scale, ry * Scale, c);
+
+    /// <summary>Draws a <see cref="PixelCanvas"/> 1:1 in device pixels with its top-left at (x, y) DIPs.</summary>
+    public void Pixels(PixelCanvas canvas, float x, float y, float opacity = 1f) =>
+        Surface.DrawCanvas(canvas, MathF.Round(X(x)), MathF.Round(Y(y)), opacity);
 
     public void FillCircle(float cx, float cy, float r, Color c) =>
         Surface.FillEllipse(X(cx), Y(cy), r * Scale, r * Scale, c);

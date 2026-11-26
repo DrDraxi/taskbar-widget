@@ -12,6 +12,12 @@ public sealed class WidgetOptions
     /// <summary>Exit the process if another instance of this widget is already running. Default true.</summary>
     public bool SingleInstance { get; init; } = true;
 
+    /// <summary>
+    /// Extra drawing room above the taskbar, in DIPs (default 0). Elements may draw into it (negative Y);
+    /// it stays click-through except where something is drawn. Useful for pop-out hover effects.
+    /// </summary>
+    public float OverflowTop { get; init; }
+
     /// <summary>Modifier that makes right-click open the menu even when a right-click handler exists. Default Shift.</summary>
     public MenuModifier MenuModifier { get; init; } = MenuModifier.Shift;
 
@@ -73,7 +79,9 @@ public sealed unsafe class Widget : IDisposable
     List<Element> _elements = new();
     float[] _elemHover = Array.Empty<float>();
     float _scale = 1;
-    int _width, _height;
+    int _width, _height;      // _height = taskbar band; the window is _overflow px taller
+    int _overflow;
+    bool _frameRequested;
 
     // Placement
     TaskbarInfo _tb;
@@ -382,15 +390,19 @@ public sealed unsafe class Widget : IDisposable
         if (_hwnd == IntPtr.Zero || _height <= 0 || _width <= 0) return;
         var theme = Theme.Current;
         float s = _scale;
+        float top = _overflow;
 
-        _surface.EnsureSize(_width, _height);
-        _surface.Begin(hitAlpha: true);
+        _surface.EnsureSize(_width, _height + _overflow);
+        _surface.Begin(hitAlpha: false);
+        // The taskbar band gets a near-invisible fill so all of it receives mouse input (fully transparent
+        // layered pixels are click-through). The overflow area above stays click-through unless drawn on.
+        _surface.FillRect(new RectF(0, top, _width, top + _height), new Color(1, 0, 0, 0));
 
         // Hover pill, like native taskbar buttons.
         float hv = Ease(_hoverAnim);
         if (hv > 0.001f)
         {
-            var box = new RectF(InsetX * s, InsetY * s, _width - InsetX * s, _height - InsetY * s);
+            var box = new RectF(InsetX * s, top + InsetY * s, _width - InsetX * s, top + _height - InsetY * s);
             var fill = Color.Lerp(theme.HoverFill, theme.PressedFill, Ease(_pressAnim));
             _surface.FillRoundRect(box, HoverRadius * s, fill.WithOpacity(hv));
             float hb = 0.5f * MathF.Max(1, MathF.Round(s));
@@ -398,21 +410,28 @@ public sealed unsafe class Widget : IDisposable
                 theme.HoverStroke.WithOpacity(hv), hb * 2);
         }
 
-        var g = new Graphics(s, theme) { Surface = _surface };
+        _frameRequested = false;
+        var g = new Graphics(s, theme) { Surface = _surface, FrameRequested = () => _frameRequested = true };
         float ox = (InsetX + Padding) * s;
-        for (int i = 0; i < _elements.Count; i++)
+        // The hovered element is drawn last so pop-out effects sit on top of their neighbours.
+        for (int pass = 0; pass < 2; pass++)
         {
-            var e = _elements[i];
-            if (e.IsSpacer || e.Draw == null) continue;
-            g.OriginX = MathF.Round(ox + e.X * s);
-            g.OriginY = MathF.Round((_height - e.Height * s) / 2f);
-            var state = new ElementState(Ease(_elemHover[i]), i == _pressIndex ? Ease(_pressAnim) : 0);
-            try { e.Draw(g, state); }
-            catch (Exception ex) { Log.Write($"Draw failed: {ex.Message}"); }
+            for (int i = 0; i < _elements.Count; i++)
+            {
+                if ((i == _hoverIndex) != (pass == 1)) continue;
+                var e = _elements[i];
+                if (e.IsSpacer || e.Draw == null) continue;
+                g.OriginX = MathF.Round(ox + e.X * s);
+                g.OriginY = MathF.Round(top + (_height - e.Height * s) / 2f);
+                var state = new ElementState(Ease(_elemHover[i]), i == _pressIndex ? Ease(_pressAnim) : 0);
+                try { e.Draw(g, state); }
+                catch (Exception ex) { Log.Write($"Draw failed: {ex.Message}"); }
+            }
         }
 
         _surface.End();
         Present();
+        if (_frameRequested) StartAnim(); // an element is animating: keep the frame clock running
     }
 
     void Present()
@@ -471,6 +490,7 @@ public sealed unsafe class Widget : IDisposable
             int oldWidth = _width;
             _scale = tb.Scale;
             _height = tb.Rect.Height;
+            _overflow = (int)MathF.Ceiling(_options.OverflowTop * _scale);
             Rebuild();
             if (_width != oldWidth) WidgetOrder.Broadcast(); // neighbours must use our new width
         }
@@ -486,7 +506,7 @@ public sealed unsafe class Widget : IDisposable
 
         int x = TaskbarLayout.ComputeX(tb, _name, _hwnd, _width);
         _targetX = x;
-        _y = tb.Rect.Top;
+        _y = tb.Rect.Top - _overflow;
 
         if (!_placed || !_visible)
         {
@@ -535,7 +555,7 @@ public sealed unsafe class Widget : IDisposable
         long now = Environment.TickCount64;
         float dt = Math.Clamp(now - _lastTick, 1, 50) / 1000f;
         _lastTick = now;
-        bool active = false, repaint = false, moved = false;
+        bool active = false, repaint = _frameRequested, moved = false;
 
         // Position: exponential glide (time-constant based, so frame drops don't change the speed).
         if (!_dragging && Math.Abs(_targetX - _x) > 0.01)
@@ -552,6 +572,7 @@ public sealed unsafe class Widget : IDisposable
             repaint |= Step(ref _elemHover[i], i == _hoverIndex && !_dragging ? 1 : 0, dt / 0.14f, ref active);
 
         if (repaint) Paint(); // also presents at the new position
+        if (_frameRequested) active = true;
         else if (moved)
             Native.SetWindowPos(_hwnd, IntPtr.Zero, (int)Math.Round(_x), _y, 0, 0,
                 Native.SWP_NOSIZE | Native.SWP_NOZORDER | Native.SWP_NOACTIVATE | Native.SWP_NOOWNERZORDER);
@@ -600,7 +621,7 @@ public sealed unsafe class Widget : IDisposable
         var anchor = new Native.RECT
         {
             Left = (int)Math.Round(_x + InsetX * s), Right = (int)Math.Round(_x + _width - InsetX * s),
-            Top = _y + (int)(InsetY * s), Bottom = _y + _height,
+            Top = _overflow > 0 ? _y : _y + (int)(InsetY * s), Bottom = _y + _overflow + _height,
         };
         _tooltip.Show(_hwnd, anchor, title, body, s, Theme.Current);
     }
@@ -676,7 +697,7 @@ public sealed unsafe class Widget : IDisposable
         Native.ReleaseCapture();
         StartAnim();
 
-        bool inside = x >= 0 && y >= 0 && x < _width && y < _height;
+        bool inside = x >= 0 && y >= 0 && x < _width && y < _height + _overflow;
         if (!inside) { OnMouseLeave(); return; }
         ArmLeaveTracking();
         if (wasDragging) return;

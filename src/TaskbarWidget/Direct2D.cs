@@ -212,6 +212,8 @@ internal sealed unsafe class Surface : IDisposable
 {
     IntPtr _memDc, _dib, _oldBmp, _rt, _brush;
     readonly Dictionary<(WidgetImage, int, int), IntPtr> _bitmaps = new();
+    readonly Dictionary<PixelCanvas, (IntPtr Bmp, int W, int H, int Version, long Used)> _canvases = new();
+    long _frame;
 
     public int Width { get; private set; }
     public int Height { get; private set; }
@@ -269,7 +271,14 @@ internal sealed unsafe class Surface : IDisposable
     {
         ulong t1, t2;
         int hr = ((delegate* unmanaged<IntPtr, ulong*, ulong*, int>)Com.Vt(_rt)[49])(_rt, &t1, &t2);
-        if (hr == D2D.D2DERR_RECREATE_TARGET || hr < 0) ReleaseTarget(); // recreated lazily next frame
+        if (hr == D2D.D2DERR_RECREATE_TARGET || hr < 0) { ReleaseTarget(); return; } // recreated lazily next frame
+
+        // Drop GPU copies of canvases that haven't been drawn for a while (e.g. a can that was drunk).
+        if (++_frame % 240 == 0)
+            foreach (var key in _canvases.Where(kv => _frame - kv.Value.Used > 240).Select(kv => kv.Key).ToList())
+            {
+                var b = _canvases[key].Bmp; Com.Release(ref b); _canvases.Remove(key);
+            }
     }
 
     IntPtr Brush(Color c)
@@ -350,10 +359,42 @@ internal sealed unsafe class Surface : IDisposable
             (_rt, bmp, &r, Math.Clamp(opacity, 0f, 1f), 1, null);
     }
 
+    public void DrawCanvas(PixelCanvas c, float x, float y, float opacity)
+    {
+        if (opacity <= 0) return;
+        _canvases.TryGetValue(c, out var e);
+        fixed (uint* px = c.Pixels)
+        {
+            if (e.Bmp == IntPtr.Zero || e.W != c.Width || e.H != c.Height)
+            {
+                if (e.Bmp != IntPtr.Zero) { var old = e.Bmp; Com.Release(ref old); }
+                var size = new SizeU { W = (uint)c.Width, H = (uint)c.Height };
+                var props = D2D.BitmapPropsPremul();
+                IntPtr bmp;
+                Com.Check(((delegate* unmanaged<IntPtr, SizeU, void*, uint, BitmapProps*, IntPtr*, int>)Com.Vt(_rt)[4])
+                    (_rt, size, px, (uint)(c.Width * 4), &props, &bmp), "CreateBitmap");
+                e = (bmp, c.Width, c.Height, c.Version, _frame);
+            }
+            else if (e.Version != c.Version)
+            {
+                // ID2D1Bitmap::CopyFromMemory (slot 10)
+                ((delegate* unmanaged<IntPtr, void*, void*, uint, int>)Com.Vt(e.Bmp)[10])(e.Bmp, null, px, (uint)(c.Width * 4));
+                e.Version = c.Version;
+            }
+        }
+        e.Used = _frame;
+        _canvases[c] = e;
+        var r = new RectF(x, y, x + c.Width, y + c.Height);
+        ((delegate* unmanaged<IntPtr, IntPtr, RectF*, float, int, RectF*, void>)Com.Vt(_rt)[26])
+            (_rt, e.Bmp, &r, Math.Clamp(opacity, 0f, 1f), 0 /* nearest: canvas is already pixel-exact */, null);
+    }
+
     void ReleaseTarget()
     {
         foreach (var kv in _bitmaps) { var b = kv.Value; Com.Release(ref b); }
         _bitmaps.Clear();
+        foreach (var kv in _canvases) { var b = kv.Value.Bmp; Com.Release(ref b); }
+        _canvases.Clear();
         Com.Release(ref _brush);
         Com.Release(ref _rt);
     }
