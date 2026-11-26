@@ -1,775 +1,846 @@
+using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
-using TaskbarWidget.Interaction;
-using TaskbarWidget.Ordering;
-using TaskbarWidget.Rendering;
-using TaskbarWidget.Theming;
-using TaskbarWidget.Timing;
 
 namespace TaskbarWidget;
 
-/// <summary>
-/// Main entry point for creating a taskbar widget.
-/// Orchestrates rendering, interaction, tooltips, timers, and positioning.
-/// </summary>
-public sealed class Widget : IDisposable
+/// <summary>Options for a <see cref="Widget"/>.</summary>
+public sealed class WidgetOptions
 {
-    private const uint WM_INVALIDATE = Native.WM_USER + 1;
+    /// <summary>Allow dragging the widget to reorder it among other taskbar widgets. Default true.</summary>
+    public bool AllowReorder { get; init; } = true;
 
-    // Hover styling defaults (match native taskbar icon hover)
-    private const int HoverMarginTop = 4;
-    private const int HoverMarginBottom = 4;
-    private const int HoverMarginLeft = 4;
-    private const int HoverMarginRight = 4;
-    private const int HoverCornerRadius = 4;
-    private const int ContentPaddingLeft = 6;
-    private const int ContentPaddingRight = 6;
+    /// <summary>Exit the process if another instance of this widget is already running. Default true.</summary>
+    public bool SingleInstance { get; init; } = true;
 
-    // Resize animation constants
-    private const int ResizeAnimTimerId = 9998;
-    private const int ResizeAnimIntervalMs = 16; // ~60fps
-    private const double ResizeAnimLerp = 0.25;
-    private const double ResizeAnimSnap = 0.5;
+    /// <summary>Items for the widget's right-click / Shift+right-click menu. "Exit" is always appended.</summary>
+    public Action<MenuBuilder>? Menu { get; init; }
+}
 
-    // Fullscreen detection constants
-    private const int FullscreenCheckTimerId = 9997;
-    private const int FullscreenCheckIntervalMs = 500;
+/// <summary>
+/// A widget living on the Windows 11 taskbar, rendered with Direct2D into a per-pixel-alpha layered window.
+/// </summary>
+/// <example>
+/// <code>
+/// var w = new Widget("Hello", ui => ui.Text("Hello!"));
+/// w.Show();
+/// Widget.Run();
+/// </code>
+/// </example>
+public sealed unsafe class Widget : IDisposable
+{
+    // Layout of the widget box (DIPs). The hover pill is inset like native taskbar buttons.
+    const float InsetX = 2, InsetY = 4, Padding = 8, HoverRadius = 5;
 
-    private readonly string _name;
-    private readonly Action<RenderContext> _render;
-    private readonly WidgetOptions _options;
-    private readonly WndProcDelegate _wndProc;
+    const uint WM_INVALIDATE = Native.WM_APP + 1, WM_RELAYOUT = Native.WM_APP + 2, WM_INVOKE = Native.WM_APP + 3;
+    const uint WM_THREAD_RECREATE = Native.WM_APP + 9; // posted to the thread when a window dies unexpectedly
+    const int TimerAnim = 1, TimerSafety = 2, TimerTooltip = 3, TimerUserBase = 100;
+    const int SafetyIntervalMs = 1000, TooltipDelayMs = 450;
 
-    private TaskbarInjectionHelper? _helper;
-    private readonly MouseTracker _mouseTracker = new();
-    private readonly TooltipManager _tooltipManager = new();
-    private readonly TimerManager _timerManager = new();
-    private readonly DropTarget _dropTarget = new();
-    private readonly DragManager _dragManager = new();
+    static readonly List<Widget> All = new();
+    static IntPtr _fgHook, _locHook;
+    static uint _locHookPid, _taskbarCreatedMsg, _uiThreadId;
+    static Mutex? _instanceMutex;
 
-    private int _pendingClickX;
-    private int _pendingClickY;
+    readonly string _name;
+    readonly Action<Ui> _build;
+    readonly WidgetOptions _options;
+    readonly Surface _surface = new();
+    readonly Tooltip _tooltip = new();
+    readonly ConcurrentQueue<Action> _invokeQueue = new();
+    readonly Dictionary<int, (Action Callback, uint Ms, bool Once)> _timers = new();
+    int _nextTimer = TimerUserBase;
 
-    private IntPtr _hwnd;
-    private int _width;
-    private int _height;
-    private double _dpiScale = 1.0;
-    private bool _isHovering;
-    private bool _hiddenForFullscreen;
-    private bool _disposed;
-    private uint _repositionMsg;
+    IntPtr _hwnd, _owner;
+    bool _closing, _disposed;
+    int _invalidatePending, _relayoutPending;
 
-    // Current render state
-    private LayoutNode? _rootNode;
-    private string? _widgetTooltipTitle;
-    private string? _widgetTooltipBody;
+    // Content
+    Ui? _ui;
+    List<Element> _elements = new();
+    float[] _elemHover = Array.Empty<float>();
+    float _scale = 1;
+    int _width, _height;
 
-    // Resize animation state: this widget drives smooth repositioning
-    // of ALL widgets when its own size changes.
-    private Dictionary<IntPtr, double>? _resizeAnimX;
-    private Dictionary<IntPtr, int>? _resizeTargetX;
-    private int _resizeAnimY;
+    // Placement
+    TaskbarInfo _tb;
+    double _x;
+    int _targetX, _y;
+    bool _placed, _visible, _hiddenForFullscreen;
 
-    /// <summary>
-    /// Create a new widget.
-    /// </summary>
-    /// <param name="name">Unique name for this widget (used for ordering).</param>
-    /// <param name="render">Render callback that builds the widget's visual tree.</param>
-    /// <param name="options">Optional configuration.</param>
-    public Widget(string name, Action<RenderContext> render, WidgetOptions? options = null)
+    // Interaction
+    bool _mouseInside, _mouseDown, _dragging;
+    int _hoverIndex = -1, _pressIndex = -1;
+    float _hoverAnim, _pressAnim;
+    int _downScreenX, _dragOffset;
+    List<string>? _dragOriginalOrder;
+    List<string>? _lastPreview;
+    long _lastTick;
+
+    public Widget(string name, Action<Ui> build, WidgetOptions? options = null)
     {
+        if (string.IsNullOrWhiteSpace(name) || name.Any(c => !(char.IsAsciiLetterOrDigit(c) || c is '_' or '-')))
+            throw new ArgumentException("Widget name must be non-empty and contain only letters, digits, '_' or '-'.", nameof(name));
         _name = name;
-        _render = render;
+        _build = build;
         _options = options ?? new WidgetOptions();
-        _wndProc = WndProc;
     }
 
-    public IntPtr WindowHandle => _hwnd;
-    public double DpiScale => _dpiScale;
+    public string Name => _name;
+    public IntPtr Handle => _hwnd;
+    public float Scale => _scale;
+    public Theme Theme => Theme.Current;
 
-    /// <summary>
-    /// Initialize and show the widget in the taskbar.
-    /// </summary>
+    /// <summary>Raised on the UI thread after the PC resumes from sleep (good moment to refresh data).</summary>
+    public event Action? Resumed;
+
+    // ── Public API ──────────────────────────────────────────────────────
+
+    /// <summary>Creates the widget window and places it on the taskbar. Call on the thread that will run <see cref="Run"/>.</summary>
     public void Show()
     {
-        if (_disposed) return;
+        if (_disposed || _hwnd != IntPtr.Zero) return;
+        Log.Init(_name);
 
-        // Register with ordering system
-        WidgetOrderManager.Register(_name);
-        _repositionMsg = WidgetOrderManager.RepositionMessage;
-
-        var config = new TaskbarInjectionConfig
+        if (_options.SingleInstance)
         {
-            ClassName = $"TaskbarWidget_{_name}",
-            WindowTitle = _name,
-            WidthDip = 40, // initial, will be resized
-            Margin = _options.Margin,
-            DeferInjection = true,
-            WndProc = _wndProc,
-            ExStyle = Native.WS_EX_LAYERED | Native.WS_EX_TOOLWINDOW | Native.WS_EX_TOPMOST
-        };
-
-        _helper = new TaskbarInjectionHelper(config, _options.Log);
-        var result = _helper.Initialize();
-        if (!result.Success || result.WindowHandle == IntPtr.Zero)
-        {
-            _options.Log?.Invoke($"Widget '{_name}' initialization failed: {result.Error}");
-            return;
+            _instanceMutex = new Mutex(true, $@"Local\TaskbarWidget.Instance.{_name}", out bool created);
+            if (!created) { Log.Write("Another instance is already running; exiting."); Environment.Exit(0); }
         }
 
-        _hwnd = result.WindowHandle;
-        _height = result.Height;
-        _dpiScale = result.DpiScale;
+        EnsureProcessInit();
+        All.Add(this);
+        WidgetOrder.EnsureRegistered(_name);
 
-        _timerManager.SetHwnd(_hwnd);
-        _tooltipManager.EnsureWindow();
+        var tb = TaskbarLayout.Query();
+        CreateWindow(tb.Valid ? tb.Handle : IntPtr.Zero);
+        if (_hwnd == IntPtr.Zero) throw new InvalidOperationException("Could not create the widget window");
+        Log.Write($"Started. {tb}");
 
-        // Enable file drop
-        _dropTarget.EnableFileDrop(_hwnd);
-
-        // Build initial tree and render
-        RebuildAndRender();
-
-        // Position and show
-        PositionOverTaskbar();
-        _helper.Show();
-
-        // Start fullscreen detection
-        Native.SetTimer(_hwnd, (IntPtr)FullscreenCheckTimerId, FullscreenCheckIntervalMs, IntPtr.Zero);
-
-        // Final render at correct screen position
-        RenderToScreen();
+        DrainInvokeQueue();
+        Relayout();
+        WidgetOrder.Broadcast(); // let other widgets make room
     }
 
-    /// <summary>
-    /// Request a re-render. Thread-safe - posts a message if called from another thread.
-    /// </summary>
+    /// <summary>Rebuilds and repaints the widget. Thread-safe; multiple calls are coalesced.</summary>
     public void Invalidate()
     {
         if (_hwnd == IntPtr.Zero) return;
-        Native.PostMessageW(_hwnd, WM_INVALIDATE, IntPtr.Zero, IntPtr.Zero);
+        if (Interlocked.Exchange(ref _invalidatePending, 1) == 0)
+            Native.PostMessageW(_hwnd, WM_INVALIDATE, 0, 0);
     }
 
-    /// <summary>
-    /// Set a repeating interval timer.
-    /// </summary>
-    public int SetInterval(TimeSpan interval, Action callback)
+    /// <summary>Runs <paramref name="action"/> on the UI thread. Thread-safe.</summary>
+    public void Post(Action action)
     {
-        return _timerManager.SetInterval(interval, callback);
+        _invokeQueue.Enqueue(action);
+        if (_hwnd != IntPtr.Zero) Native.PostMessageW(_hwnd, WM_INVOKE, 0, 0);
     }
 
-    /// <summary>
-    /// Set a one-shot timeout timer.
-    /// </summary>
-    public int SetTimeout(TimeSpan delay, Action callback)
-    {
-        return _timerManager.SetTimeout(delay, callback);
-    }
+    /// <summary>Repeating timer on the UI thread. Returns a handle for <see cref="ClearTimer"/>.</summary>
+    public int SetInterval(TimeSpan interval, Action callback) => AddTimer(interval, callback, once: false);
 
-    /// <summary>
-    /// Cancel a timer.
-    /// </summary>
+    /// <summary>One-shot timer on the UI thread.</summary>
+    public int SetTimeout(TimeSpan delay, Action callback) => AddTimer(delay, callback, once: true);
+
     public void ClearTimer(int handle)
     {
-        _timerManager.ClearTimer(handle);
+        if (_timers.Remove(handle) && _hwnd != IntPtr.Zero) Native.KillTimer(_hwnd, handle);
     }
 
-    /// <summary>
-    /// Set widget-level file drop handler.
-    /// </summary>
-    public void OnFileDrop(Action<string[]> handler)
+    /// <summary>Opens the widget's context menu at the cursor.</summary>
+    public void ShowMenu()
     {
-        _dropTarget.SetFileDropHandler(handler);
-    }
+        var mb = new MenuBuilder();
+        _options.Menu?.Invoke(mb);
+        if (mb.Items.Count > 0) mb.Separator();
+        mb.Item("Exit", Exit);
 
-    /// <summary>
-    /// Set widget-level text drop handler.
-    /// </summary>
-    public void OnTextDrop(Action<string> handler)
-    {
-        _dropTarget.SetTextDropHandler(handler);
-    }
-
-    /// <summary>
-    /// Run the Win32 message loop. Call after Show().
-    /// </summary>
-    public static void RunMessageLoop()
-    {
-        // Initialize common controls
-        var icc = new Native.INITCOMMONCONTROLSEX
+        var menu = Native.CreatePopupMenu();
+        for (int i = 0; i < mb.Items.Count; i++)
         {
-            dwSize = Marshal.SizeOf<Native.INITCOMMONCONTROLSEX>(),
-            dwICC = Native.ICC_WIN95_CLASSES
-        };
-        Native.InitCommonControlsEx(ref icc);
-
-        while (Native.GetMessageW(out var msg, IntPtr.Zero, 0, 0))
-        {
-            Native.TranslateMessage(ref msg);
-            Native.DispatchMessageW(ref msg);
+            var it = mb.Items[i];
+            uint flags = it.Text == null ? Native.MF_SEPARATOR
+                : Native.MF_STRING | (it.Checked ? Native.MF_CHECKED : 0) | (it.Enabled ? 0 : Native.MF_GRAYED);
+            Native.AppendMenuW(menu, flags, i + 1, it.Text);
         }
+
+        _tooltip.Hide();
+        Native.GetCursorPos(out var pt);
+        bool fg = Native.SetForegroundWindow(_hwnd); // required so the menu closes when clicking elsewhere
+        int cmd = Native.TrackPopupMenuEx(menu,
+            Native.TPM_RETURNCMD | Native.TPM_RIGHTBUTTON | Native.TPM_BOTTOMALIGN | Native.TPM_NONOTIFY,
+            pt.X, pt.Y, _hwnd, IntPtr.Zero);
+        Log.Debug($"menu fg={fg} cmd={cmd} err={Marshal.GetLastWin32Error()}");
+        Native.DestroyMenu(menu);
+        Native.PostMessageW(_hwnd, 0 /* WM_NULL */, 0, 0);
+
+        if (cmd > 0 && cmd <= mb.Items.Count) mb.Items[cmd - 1].Action?.Invoke();
     }
 
-    private void RebuildAndRender()
+    /// <summary>Runs the message loop until <see cref="Exit"/> is called or all widgets are closed.</summary>
+    public static void Run()
     {
-        var root = new LayoutNode { Type = LayoutNodeType.Root };
-        var ctx = new RenderContext(root, _dpiScale);
-        _render(ctx);
-
-        _widgetTooltipTitle = ctx.TooltipTitle;
-        _widgetTooltipBody = ctx.TooltipBody;
-
-        // Measure
-        var screenDc = Native.GetDC(IntPtr.Zero);
-        LayoutEngine.Measure(root, _dpiScale, screenDc);
-        Native.ReleaseDC(IntPtr.Zero, screenDc);
-
-        // Force root height to taskbar height
-        root.Height = _height;
-
-        // Add padding so content fits inside the hover overlay with breathing room (scaled to DPI)
-        int hPad = (int)Math.Ceiling((HoverMarginLeft + HoverMarginRight + ContentPaddingLeft + ContentPaddingRight) * _dpiScale);
-        root.Width += hPad;
-
-        // Arrange
-        LayoutEngine.Arrange(root);
-
-        _rootNode = root;
-        _mouseTracker.SetRoot(root, _dpiScale);
-
-        // Track new width — actual resize deferred to PositionOverTaskbar()
-        // so resize + reposition happen atomically in one SetWindowPos call.
-        int newWidth = root.Width;
-        if (newWidth > 0)
-            _width = newWidth;
-    }
-
-    private void RenderToScreen()
-    {
-        if (_rootNode == null || _hwnd == IntPtr.Zero) return;
-
-        GdiRenderer.HoverOverlay? hover = null;
-        var hoveredPanel = _mouseTracker.HoveredPanel;
-        bool showHover = _isHovering && hoveredPanel != null
-            && (_options.RootHover || hoveredPanel.Type != LayoutNodeType.Root);
-        if (showHover)
+        Native.MSG msg;
+        while (Native.GetMessageW(&msg, IntPtr.Zero, 0, 0) > 0)
         {
-            var theme = ThemeDetector.CurrentTheme;
-            int scaledMarginLeft = (int)Math.Ceiling(HoverMarginLeft * _dpiScale);
-            int scaledMarginRight = (int)Math.Ceiling(HoverMarginRight * _dpiScale);
-            int scaledMarginTop = (int)Math.Ceiling(HoverMarginTop * _dpiScale);
-            int scaledMarginBottom = (int)Math.Ceiling(HoverMarginBottom * _dpiScale);
-
-            int marginLeft = scaledMarginLeft;
-            int marginRight = scaledMarginRight;
-
-            // Target overlay to the hovered panel when it opts into individual hover
-            var panel = hoveredPanel!;
-            if (panel.HoverBackground != null)
+            if (msg.hwnd == IntPtr.Zero && msg.message == WM_THREAD_RECREATE)
             {
-                marginLeft = panel.AbsX;
-                marginRight = _width - (panel.AbsX + panel.Width);
+                foreach (var w in All.ToArray()) w.RecreateIfLost();
+                continue;
             }
-
-            hover = new GdiRenderer.HoverOverlay
-            {
-                MarginLeft = marginLeft,
-                MarginTop = scaledMarginTop,
-                MarginRight = marginRight,
-                MarginBottom = scaledMarginBottom,
-                CornerRadius = HoverCornerRadius,
-                Color = theme.HoverBackground
-            };
-        }
-
-        GdiRenderer.Render(_hwnd, _rootNode, _dpiScale, hover);
-    }
-
-    private void PositionOverTaskbar()
-    {
-        if (_helper == null) return;
-
-        var taskbarHandle = _helper.TaskbarHandle;
-        Native.GetWindowRect(taskbarHandle, out var taskbarRect);
-
-        int orderIndex = WidgetOrderManager.GetOrderIndex(_name);
-        var slotFinder = new TaskbarSlotFinder();
-        var slot = slotFinder.FindSlot(_width, _hwnd, _options.Margin, orderIndex, _options.Log);
-
-        // Sync height from current taskbar bounds (may change with DPI)
-        int taskbarHeight = slotFinder.TaskbarBounds.Height;
-        if (taskbarHeight > 0 && taskbarHeight != _height)
-            _height = taskbarHeight;
-
-        int screenX = taskbarRect.Left + slot.X;
-        int screenY = taskbarRect.Top + slot.Y;
-
-        Native.SetWindowPos(_hwnd, Native.HWND_TOPMOST, screenX, screenY, _width, _height,
-            Native.SWP_NOACTIVATE);
-    }
-
-    /// <summary>
-    /// Start a smooth resize animation that lerps all widgets to their
-    /// new positions over several frames, instead of snapping instantly.
-    /// </summary>
-    private void StartResizeAnimation()
-    {
-        var taskbar = Native.FindTaskbar();
-        if (taskbar == IntPtr.Zero) { PositionOverTaskbar(); return; }
-
-        Native.GetWindowRect(taskbar, out var taskbarRect);
-        var trayNotify = Native.FindTrayNotifyWnd(taskbar);
-
-        const int margin = 4;
-        int rightBoundary;
-        if (trayNotify != IntPtr.Zero)
-        {
-            Native.GetWindowRect(trayNotify, out var trayRect);
-            rightBoundary = trayRect.Left - margin;
-        }
-        else
-        {
-            rightBoundary = taskbarRect.Right - 100;
-        }
-
-        // Get order and enumerate all widget windows
-        var order = WidgetOrderManager.GetOrder();
-        var windows = new Dictionary<string, (IntPtr Hwnd, int Width, int CurrentX)>();
-
-        Native.EnumWindows((hwnd, _) =>
-        {
-            if (!Native.IsWindowVisible(hwnd)) return true;
-            var className = Native.GetClassName(hwnd);
-            if (!className.StartsWith("TaskbarWidget_", StringComparison.Ordinal)) return true;
-
-            string name = className.Substring("TaskbarWidget_".Length);
-            Native.GetWindowRect(hwnd, out var rect);
-            // Use our new width for self (on-screen rect still has old size)
-            int width = (hwnd == _hwnd) ? _width : rect.Width;
-            windows[name] = (hwnd, width, rect.Left);
-            return true;
-        }, IntPtr.Zero);
-
-        if (windows.Count < 2)
-        {
-            // Only one widget — just position directly, no animation needed
-            PositionOverTaskbar();
-            return;
-        }
-
-        // Calculate target positions right-to-left following saved order
-        _resizeAnimX ??= new Dictionary<IntPtr, double>();
-        _resizeTargetX = new Dictionary<IntPtr, int>();
-        _resizeAnimY = taskbarRect.Top;
-
-        int currentRight = rightBoundary;
-        foreach (var name in order)
-        {
-            if (!windows.TryGetValue(name, out var w)) continue;
-            int targetX = currentRight - w.Width;
-
-            // Initialize animated position from current screen position if new
-            if (!_resizeAnimX.ContainsKey(w.Hwnd))
-                _resizeAnimX[w.Hwnd] = w.CurrentX;
-
-            _resizeTargetX[w.Hwnd] = targetX;
-            currentRight = targetX - margin;
-        }
-
-        // Start the animation timer
-        Native.SetTimer(_hwnd, (IntPtr)ResizeAnimTimerId, ResizeAnimIntervalMs, IntPtr.Zero);
-    }
-
-    /// <summary>
-    /// Called on each animation timer tick. Lerps all widgets toward their
-    /// target positions and stops when everyone has arrived.
-    /// </summary>
-    private void OnResizeAnimTick()
-    {
-        if (_resizeAnimX == null || _resizeTargetX == null)
-        {
-            Native.KillTimer(_hwnd, (IntPtr)ResizeAnimTimerId);
-            return;
-        }
-
-        bool allDone = true;
-
-        foreach (var hwnd in _resizeTargetX.Keys)
-        {
-            int target = _resizeTargetX[hwnd];
-
-            if (!_resizeAnimX.TryGetValue(hwnd, out double current))
-                current = target;
-
-            double newX = current + (target - current) * ResizeAnimLerp;
-
-            if (Math.Abs(newX - target) < ResizeAnimSnap)
-                newX = target;
-            else
-                allDone = false;
-
-            _resizeAnimX[hwnd] = newX;
-
-            if (hwnd == _hwnd)
-            {
-                // Self: set both position and size
-                Native.SetWindowPos(hwnd, Native.HWND_TOPMOST,
-                    (int)Math.Round(newX), _resizeAnimY, _width, _height,
-                    Native.SWP_NOACTIVATE);
-            }
-            else
-            {
-                // Other widgets: position only
-                Native.SetWindowPos(hwnd, Native.HWND_TOPMOST,
-                    (int)Math.Round(newX), _resizeAnimY, 0, 0,
-                    Native.SWP_NOSIZE | Native.SWP_NOACTIVATE);
-            }
-        }
-
-        if (allDone)
-        {
-            Native.KillTimer(_hwnd, (IntPtr)ResizeAnimTimerId);
-            _resizeAnimX = null;
-            _resizeTargetX = null;
-
-            // Broadcast so all widgets re-render at their final positions
-            WidgetOrderManager.BroadcastReposition();
+            Native.TranslateMessage(&msg);
+            Native.DispatchMessageW(&msg);
         }
     }
 
-    /// <summary>
-    /// Detects if the widget's on-screen position has drifted from
-    /// its expected slot (e.g. tray area resized, resolution changed).
-    /// Called on a periodic timer so the widget self-corrects quickly.
-    /// </summary>
-    private void CheckPositionDrift()
+    /// <summary>Closes every widget in this process and ends <see cref="Run"/>.</summary>
+    public static void Exit()
     {
-        if (_hiddenForFullscreen || _hwnd == IntPtr.Zero || _helper == null) return;
-        if (_resizeAnimX != null) return; // resize animation owns positioning
-
-        // Safety net: catch DPI changes that weren't delivered via WM_DPICHANGED
-        var freshDpi = RefreshDpiFromTaskbar();
-        if (Math.Abs(freshDpi - _dpiScale) > 0.001)
-        {
-            HandleDpiChange(freshDpi);
-            return; // HandleDpiChange already repositions and re-renders
-        }
-
-        Native.GetWindowRect(_hwnd, out var currentRect);
-
-        var taskbarHandle = _helper.TaskbarHandle;
-        Native.GetWindowRect(taskbarHandle, out var taskbarRect);
-
-        int orderIndex = WidgetOrderManager.GetOrderIndex(_name);
-        var slotFinder = new TaskbarSlotFinder();
-        var slot = slotFinder.FindSlot(_width, _hwnd, _options.Margin, orderIndex);
-
-        int expectedX = taskbarRect.Left + slot.X;
-        int expectedY = taskbarRect.Top + slot.Y;
-
-        if (currentRect.Left != expectedX || currentRect.Top != expectedY)
-        {
-            PositionOverTaskbar();
-            RenderToScreen();
-        }
-    }
-
-    private void CheckFullscreen()
-    {
-        bool fullscreen = IsFullscreenAppOnWidgetMonitor();
-
-        if (fullscreen && !_hiddenForFullscreen)
-        {
-            _hiddenForFullscreen = true;
-            _tooltipManager.Hide(_hwnd);
-            Native.ShowWindow(_hwnd, Native.SW_HIDE);
-        }
-        else if (!fullscreen && _hiddenForFullscreen)
-        {
-            _hiddenForFullscreen = false;
-            Native.ShowWindow(_hwnd, Native.SW_SHOW);
-            PositionOverTaskbar();
-            RenderToScreen();
-        }
-    }
-
-    private bool IsFullscreenAppOnWidgetMonitor()
-    {
-        var fgWnd = Native.GetForegroundWindow();
-        if (fgWnd == IntPtr.Zero) return false;
-
-        // Ignore desktop and shell windows
-        if (fgWnd == Native.GetDesktopWindow()) return false;
-        if (fgWnd == Native.GetShellWindow()) return false;
-
-        // Only care about fullscreen on the same monitor as the widget
-        var widgetMonitor = Native.MonitorFromWindow(_hwnd, Native.MONITOR_DEFAULTTONEAREST);
-        var fgMonitor = Native.MonitorFromWindow(fgWnd, Native.MONITOR_DEFAULTTONEAREST);
-        if (widgetMonitor != fgMonitor) return false;
-
-        // Check if the foreground window covers the entire monitor
-        Native.GetWindowRect(fgWnd, out var fgRect);
-        var mi = new Native.MONITORINFO { cbSize = Marshal.SizeOf<Native.MONITORINFO>() };
-        Native.GetMonitorInfoW(widgetMonitor, ref mi);
-
-        return fgRect.Left <= mi.rcMonitor.Left && fgRect.Top <= mi.rcMonitor.Top &&
-               fgRect.Right >= mi.rcMonitor.Right && fgRect.Bottom >= mi.rcMonitor.Bottom;
-    }
-
-    private void HandleDpiChange(double newDpiScale)
-    {
-        if (Math.Abs(newDpiScale - _dpiScale) < 0.001) return;
-
-        _options.Log?.Invoke($"DPI changed: {_dpiScale:F2} → {newDpiScale:F2}");
-        _dpiScale = newDpiScale;
-
-        if (_helper != null)
-            _height = _helper.UpdateDpi(newDpiScale);
-
-        RebuildAndRender();
-        PositionOverTaskbar();
-        RenderToScreen();
-    }
-
-    private double RefreshDpiFromTaskbar()
-    {
-        var taskbar = Native.FindTaskbar();
-        return taskbar != IntPtr.Zero ? Native.GetScaleFactor(taskbar) : _dpiScale;
-    }
-
-    private IntPtr WndProc(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam)
-    {
-        // Check for reposition broadcast
-        if (msg == _repositionMsg && _repositionMsg != 0)
-        {
-            // Skip if we're driving a resize animation (we handle positioning)
-            if (_resizeAnimX == null)
-            {
-                PositionOverTaskbar();
-                RenderToScreen();
-            }
-            return IntPtr.Zero;
-        }
-
-        switch (msg)
-        {
-            case Native.WM_MOUSEMOVE:
-            {
-                // During drag, move widget and skip hover/tooltip
-                if (_dragManager.IsMouseDown)
-                {
-                    Native.GetCursorPos(out var pt);
-                    if (_dragManager.OnMouseMove(hwnd, pt.X, pt.Y))
-                    {
-                        _tooltipManager.Hide(_hwnd);
-                        return IntPtr.Zero;
-                    }
-                }
-
-                int x = (short)(lParam.ToInt64() & 0xFFFF);
-                int y = (short)((lParam.ToInt64() >> 16) & 0xFFFF);
-
-                bool wasHovering = _isHovering;
-                _isHovering = true;
-                bool panelChanged = _mouseTracker.OnMouseMove(hwnd, x, y);
-
-                if (!wasHovering || panelChanged)
-                {
-                    RenderToScreen();
-
-                    // Hide tooltip when switching panels so it re-renders with new content
-                    if (panelChanged)
-                        _tooltipManager.Hide(_hwnd);
-
-                    // Tooltip handling
-                    var (panelTitle, panelBody) = _mouseTracker.GetHoveredTooltip();
-                    string? title = panelTitle ?? _widgetTooltipTitle;
-                    string? body = panelBody ?? _widgetTooltipBody;
-
-                    if (title != null || body != null)
-                        _tooltipManager.RequestShow(_hwnd, title, body);
-                }
-                return IntPtr.Zero;
-            }
-
-            case Native.WM_MOUSELEAVE:
-            {
-                _isHovering = false;
-                _mouseTracker.OnMouseLeave();
-                RenderToScreen();
-                _tooltipManager.Hide(_hwnd);
-                return IntPtr.Zero;
-            }
-
-            case Native.WM_LBUTTONDOWN:
-            case Native.WM_LBUTTONDBLCLK:
-            {
-                int x = (short)(lParam.ToInt64() & 0xFFFF);
-                int y = (short)((lParam.ToInt64() >> 16) & 0xFFFF);
-
-                // Save local coords for deferred click dispatch
-                _pendingClickX = x;
-                _pendingClickY = y;
-
-                // Start drag tracking (captures mouse)
-                Native.GetCursorPos(out var pt);
-                _dragManager.OnLeftButtonDown(hwnd, pt.X, pt.Y);
-
-                return IntPtr.Zero;
-            }
-
-            case Native.WM_RBUTTONDOWN:
-            case Native.WM_RBUTTONDBLCLK:
-            {
-                int x = (short)(lParam.ToInt64() & 0xFFFF);
-                int y = (short)((lParam.ToInt64() >> 16) & 0xFFFF);
-                _mouseTracker.OnRightButtonDown(x, y);
-                return IntPtr.Zero;
-            }
-
-            case Native.WM_LBUTTONUP:
-            {
-                bool wasDragging = _dragManager.OnLeftButtonUp(hwnd, _name);
-                if (!wasDragging)
-                {
-                    // Was a click, not a drag — dispatch the deferred click
-                    _mouseTracker.OnLeftButtonDown(_pendingClickX, _pendingClickY);
-                }
-                return IntPtr.Zero;
-            }
-
-            case Native.WM_SETCURSOR:
-            {
-                if (_dragManager.IsDragging)
-                {
-                    Native.SetCursor(Native.LoadCursorW(IntPtr.Zero, Native.IDC_SIZEALL));
-                    return (IntPtr)1;
-                }
-                break;
-            }
-
-            case Native.WM_CAPTURECHANGED:
-            {
-                if (_dragManager.WasCommitted)
-                {
-                    // Drag completed — widget already at target slot, just re-render
-                    RenderToScreen();
-                }
-                else
-                {
-                    // Drag cancelled — snap everything back
-                    _dragManager.CancelDrag(hwnd);
-                    WidgetOrderManager.BroadcastReposition();
-                }
-                return IntPtr.Zero;
-            }
-
-            case Native.WM_TIMER:
-            {
-                int timerId = (int)wParam;
-                if (timerId == FullscreenCheckTimerId)
-                {
-                    CheckFullscreen();
-                    CheckPositionDrift();
-                    return IntPtr.Zero;
-                }
-                if (timerId == ResizeAnimTimerId)
-                {
-                    OnResizeAnimTick();
-                    return IntPtr.Zero;
-                }
-                if (timerId == TooltipManager.ShowTimerId)
-                {
-                    _tooltipManager.OnShowTimer(_hwnd, _dpiScale);
-                    return IntPtr.Zero;
-                }
-                if (timerId == TooltipManager.FadeTimerId)
-                {
-                    _tooltipManager.OnFadeTimer(_hwnd);
-                    return IntPtr.Zero;
-                }
-                if (_timerManager.OnTimer(wParam))
-                    return IntPtr.Zero;
-                break;
-            }
-
-            case Native.WM_DPICHANGED:
-            {
-                HandleDpiChange(Native.GetDpiScaleFromWParam(wParam));
-                return IntPtr.Zero;
-            }
-
-            case Native.WM_SETTINGCHANGE:
-            {
-                ThemeDetector.OnSettingChange();
-                var freshDpi = RefreshDpiFromTaskbar();
-                if (Math.Abs(freshDpi - _dpiScale) > 0.001)
-                {
-                    HandleDpiChange(freshDpi);
-                }
-                else
-                {
-                    RebuildAndRender();
-                    PositionOverTaskbar();
-                    RenderToScreen();
-                }
-                return IntPtr.Zero;
-            }
-
-            case Native.WM_DISPLAYCHANGE:
-            {
-                var freshDpi = RefreshDpiFromTaskbar();
-                if (Math.Abs(freshDpi - _dpiScale) > 0.001)
-                {
-                    HandleDpiChange(freshDpi);
-                }
-                else
-                {
-                    PositionOverTaskbar();
-                    RenderToScreen();
-                }
-                return IntPtr.Zero;
-            }
-
-            case Native.WM_DROPFILES:
-            {
-                _dropTarget.OnDropFiles(wParam);
-                return IntPtr.Zero;
-            }
-
-            case WM_INVALIDATE:
-            {
-                int oldWidth = _width;
-                RebuildAndRender();
-
-                if (_width != oldWidth)
-                {
-                    // Width changed — smoothly animate all widgets to new positions
-                    StartResizeAnimation();
-                }
-                else
-                {
-                    // No size change — just reposition normally
-                    PositionOverTaskbar();
-                }
-
-                RenderToScreen();
-                return IntPtr.Zero;
-            }
-        }
-
-        return Native.DefWindowProcW(hwnd, msg, wParam, lParam);
+        foreach (var w in All.ToArray()) w.Dispose();
+        Native.PostQuitMessage(0);
     }
 
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
+        _closing = true;
+        _tooltip.Dispose();
+        if (_hwnd != IntPtr.Zero && Native.IsWindow(_hwnd)) Native.DestroyWindow(_hwnd);
+        _hwnd = IntPtr.Zero;
+        _surface.Dispose();
+        All.Remove(this);
+        WidgetOrder.Broadcast(); // neighbours close the gap
+        if (All.Count == 0) RemoveHooks();
+    }
 
-        if (_hwnd != IntPtr.Zero)
-            Native.KillTimer(_hwnd, (IntPtr)FullscreenCheckTimerId);
+    // ── Setup ───────────────────────────────────────────────────────────
 
-        _timerManager.Dispose();
-        _tooltipManager.Dispose();
-        _helper?.Dispose();
+    static void EnsureProcessInit()
+    {
+        if (_uiThreadId != 0) return;
+        _uiThreadId = GetCurrentThreadId();
+        Native.SetThreadDpiAwarenessContext(-4); // per-monitor v2 even if the app manifest forgot it
+        Native.CoInitializeEx(IntPtr.Zero, 2);   // STA, for WIC
+        _taskbarCreatedMsg = Native.RegisterWindowMessageW("TaskbarCreated");
+        try { Native.SetPreferredAppMode(1); Native.FlushMenuThemes(); } catch { /* older Windows */ }
+        _fgHook = Native.SetWinEventHook(Native.EVENT_SYSTEM_FOREGROUND, Native.EVENT_SYSTEM_FOREGROUND, IntPtr.Zero,
+            &WinEventProc, 0, 0, Native.WINEVENT_OUTOFCONTEXT | Native.WINEVENT_SKIPOWNPROCESS);
+        // Watchdog: a window-less timer with a TIMERPROC is dispatched even inside modal loops
+        // (menus, message boxes), so a widget whose window died is always brought back.
+        SetTimer(IntPtr.Zero, IntPtr.Zero, 2000, &WatchdogProc);
+    }
+
+    [DllImport("user32.dll")] static extern IntPtr SetTimer(IntPtr hwnd, IntPtr id, uint ms, delegate* unmanaged<IntPtr, uint, IntPtr, uint, void> proc);
+
+    [UnmanagedCallersOnly]
+    static void WatchdogProc(IntPtr hwnd, uint msg, IntPtr id, uint time)
+    {
+        try { foreach (var w in All.ToArray()) w.RecreateIfLost(); } catch { }
+    }
+
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] static extern bool PostThreadMessageW(uint thread, uint msg, IntPtr w, IntPtr l);
+
+    /// <summary>Taskbar/tray geometry changes come from explorer; watch just that process (cheap, event driven).</summary>
+    static void EnsureExplorerHook(IntPtr taskbar)
+    {
+        if (taskbar == IntPtr.Zero) return;
+        Native.GetWindowThreadProcessId(taskbar, out uint pid);
+        if (pid == 0 || pid == _locHookPid) return;
+        if (_locHook != IntPtr.Zero) Native.UnhookWinEvent(_locHook);
+        _locHook = Native.SetWinEventHook(Native.EVENT_OBJECT_LOCATIONCHANGE, Native.EVENT_OBJECT_LOCATIONCHANGE, IntPtr.Zero,
+            &WinEventProc, pid, 0, Native.WINEVENT_OUTOFCONTEXT);
+        _locHookPid = pid;
+    }
+
+    static void RemoveHooks()
+    {
+        if (_fgHook != IntPtr.Zero) Native.UnhookWinEvent(_fgHook);
+        if (_locHook != IntPtr.Zero) Native.UnhookWinEvent(_locHook);
+        _fgHook = _locHook = IntPtr.Zero; _locHookPid = 0;
+    }
+
+    [UnmanagedCallersOnly]
+    static void WinEventProc(IntPtr hook, uint ev, IntPtr hwnd, int idObject, int idChild, uint thread, uint time)
+    {
+        try
+        {
+            if (ev == Native.EVENT_OBJECT_LOCATIONCHANGE)
+            {
+                if (idObject != 0 || hwnd == IntPtr.Zero) return; // OBJID_WINDOW only (skips cursor/caret noise)
+                foreach (var w in All)
+                    if (hwnd == w._tb.Handle || hwnd == w._tb.TrayHandle) w.RequestRelayout();
+            }
+            else
+            {
+                foreach (var w in All) w.RequestRelayout();
+            }
+        }
+        catch { }
+    }
+
+    void CreateWindow(IntPtr owner)
+    {
+        _owner = owner;
+        _hwnd = Win32Window.Create(TaskbarLayout.ClassPrefix + _name,
+            Native.WS_EX_LAYERED | Native.WS_EX_TOOLWINDOW | Native.WS_EX_TOPMOST | Native.WS_EX_NOACTIVATE,
+            owner, WndProc);
+        if (_hwnd == IntPtr.Zero && owner != IntPtr.Zero)
+        {
+            // The owner may be a taskbar that is being torn down; try unowned, re-own later.
+            _owner = IntPtr.Zero;
+            _hwnd = Win32Window.Create(TaskbarLayout.ClassPrefix + _name,
+                Native.WS_EX_LAYERED | Native.WS_EX_TOOLWINDOW | Native.WS_EX_TOPMOST | Native.WS_EX_NOACTIVATE,
+                IntPtr.Zero, WndProc);
+        }
+        if (_hwnd == IntPtr.Zero) { Log.Write("CreateWindowEx failed; will retry."); return; }
+
+        // Fresh window: forget per-window state. Messages posted to a dead window were lost, so
+        // clear the coalescing flags and re-post anything outstanding.
+        _placed = _visible = false;
+        _mouseInside = _mouseDown = _dragging = false;
+        _pressIndex = _hoverIndex = -1;
+        _invalidatePending = _relayoutPending = 0;
+        Native.SetTimer(_hwnd, TimerSafety, SafetyIntervalMs, IntPtr.Zero);
+        foreach (var (id, t) in _timers) Native.SetTimer(_hwnd, id, t.Ms, IntPtr.Zero);
+        EnsureExplorerHook(_owner);
+        if (!_invokeQueue.IsEmpty) Native.PostMessageW(_hwnd, WM_INVOKE, 0, 0);
+    }
+
+    /// <summary>Our window can be destroyed along with its owner when explorer crashes. Bring it back.</summary>
+    void RecreateIfLost()
+    {
+        if (_closing || _disposed || (_hwnd != IntPtr.Zero && Native.IsWindow(_hwnd))) return;
+        Log.Write("Widget window was destroyed (explorer restart?); recreating.");
+        var tb = TaskbarLayout.Query();
+        CreateWindow(tb.Valid ? tb.Handle : IntPtr.Zero);
+        if (_hwnd == IntPtr.Zero) return; // watchdog retries
+        Rebuild();
+        Relayout();
+    }
+
+    int AddTimer(TimeSpan t, Action cb, bool once)
+    {
+        int id = _nextTimer++;
+        uint ms = (uint)Math.Clamp(t.TotalMilliseconds, 10, int.MaxValue);
+        _timers[id] = (cb, ms, once);
+        if (_hwnd != IntPtr.Zero) Native.SetTimer(_hwnd, id, ms, IntPtr.Zero);
+        return id;
+    }
+
+    void DrainInvokeQueue()
+    {
+        while (_invokeQueue.TryDequeue(out var a))
+        {
+            try { a(); } catch (Exception ex) { Log.Write($"Posted action failed: {ex}"); }
+        }
+    }
+
+    // ── Build / paint ───────────────────────────────────────────────────
+
+    void Rebuild()
+    {
+        var ui = new Ui(_scale, Theme.Current);
+        try { _build(ui); }
+        catch (Exception ex) { Log.Write($"Build callback failed: {ex}"); }
+
+        float x = 0;
+        bool first = true, prevSpacer = false;
+        foreach (var e in ui.Elements)
+        {
+            if (e.IsSpacer) { x += e.Width; prevSpacer = true; continue; }
+            if (!first && !prevSpacer) x += ui.Spacing;
+            e.X = x;
+            x += e.Width;
+            first = false; prevSpacer = false;
+        }
+
+        _ui = ui;
+        _elements = ui.Elements;
+        if (_elemHover.Length != _elements.Count) Array.Resize(ref _elemHover, _elements.Count);
+        if (_hoverIndex >= _elements.Count) _hoverIndex = -1;
+        _width = (int)MathF.Ceiling((Math.Max(x, 8) + 2 * (InsetX + Padding)) * _scale);
+    }
+
+    void Paint()
+    {
+        if (_hwnd == IntPtr.Zero || _height <= 0 || _width <= 0) return;
+        var theme = Theme.Current;
+        float s = _scale;
+
+        _surface.EnsureSize(_width, _height);
+        _surface.Begin(hitAlpha: true);
+
+        // Hover pill, like native taskbar buttons.
+        float hv = Ease(_hoverAnim);
+        if (hv > 0.001f)
+        {
+            var box = new RectF(InsetX * s, InsetY * s, _width - InsetX * s, _height - InsetY * s);
+            var fill = Color.Lerp(theme.HoverFill, theme.PressedFill, Ease(_pressAnim));
+            _surface.FillRoundRect(box, HoverRadius * s, fill.WithOpacity(hv));
+            float hb = 0.5f * MathF.Max(1, MathF.Round(s));
+            _surface.StrokeRoundRect(new RectF(box.L + hb, box.T + hb, box.R - hb, box.B - hb), HoverRadius * s,
+                theme.HoverStroke.WithOpacity(hv), hb * 2);
+        }
+
+        var g = new Graphics(s, theme) { Surface = _surface };
+        float ox = (InsetX + Padding) * s;
+        for (int i = 0; i < _elements.Count; i++)
+        {
+            var e = _elements[i];
+            if (e.IsSpacer || e.Draw == null) continue;
+            g.OriginX = MathF.Round(ox + e.X * s);
+            g.OriginY = MathF.Round((_height - e.Height * s) / 2f);
+            var state = new ElementState(Ease(_elemHover[i]), i == _pressIndex ? Ease(_pressAnim) : 0);
+            try { e.Draw(g, state); }
+            catch (Exception ex) { Log.Write($"Draw failed: {ex.Message}"); }
+        }
+
+        _surface.End();
+        Present();
+    }
+
+    void Present()
+    {
+        var pos = new Native.POINT { X = (int)Math.Round(_x), Y = _y };
+        var size = new Native.SIZE { cx = _surface.Width, cy = _surface.Height };
+        var src = new Native.POINT();
+        var blend = new Native.BLENDFUNCTION { SourceConstantAlpha = 255, AlphaFormat = 1 };
+        Native.UpdateLayeredWindow(_hwnd, IntPtr.Zero, &pos, &size, _surface.Hdc, &src, 0, &blend, Native.ULW_ALPHA);
+    }
+
+    static float Ease(float t) => t <= 0 ? 0 : t >= 1 ? 1 : t * t * (3 - 2 * t);
+
+    // ── Placement ───────────────────────────────────────────────────────
+
+    void RequestRelayout()
+    {
+        if (_hwnd != IntPtr.Zero && Interlocked.Exchange(ref _relayoutPending, 1) == 0)
+            Native.PostMessageW(_hwnd, WM_RELAYOUT, 0, 0);
+    }
+
+    void Relayout()
+    {
+        _relayoutPending = 0;
+        if (_hwnd == IntPtr.Zero || _closing || _dragging) return;
+
+        var tb = TaskbarLayout.Query();
+        if (!tb.Valid || !tb.OnScreen)
+        {
+            // Never guess a position: with no usable taskbar the old code fell back to (x, 0) — the
+            // "widget jumped to the top of the screen" bug. Hide and wait for the next valid geometry.
+            if (_tb.Valid != tb.Valid || _tb.OnScreen != tb.OnScreen) Log.Write($"Hiding: {tb}");
+            _tb = tb;
+            SetVisible(false);
+            return;
+        }
+
+        if (tb.Handle != _owner)
+        {
+            // Explorer restarted: re-own the window to the new taskbar so it stays above it in z-order.
+            Log.Write($"Taskbar changed ({_owner:X} -> {tb.Handle:X}); re-owning.");
+            Native.SetWindowLongPtrW(_hwnd, -8 /* GWLP_HWNDPARENT */, tb.Handle);
+            _owner = tb.Handle;
+            // The new taskbar was created topmost above us; re-owning alone doesn't change z-order.
+            Native.SetWindowPos(_hwnd, Native.HWND_TOPMOST, 0, 0, 0, 0,
+                Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE);
+            EnsureExplorerHook(tb.Handle);
+            _placed = false;
+        }
+
+        bool geometryChanged = MathF.Abs(tb.Scale - _scale) > 0.001f || tb.Rect.Height != _height || _ui == null;
+        if (!_tb.Valid || !_tb.OnScreen || tb.Rect.Top != _tb.Rect.Top) _placed = false;
+        _tb = tb;
+        if (geometryChanged)
+        {
+            int oldWidth = _width;
+            _scale = tb.Scale;
+            _height = tb.Rect.Height;
+            Rebuild();
+            if (_width != oldWidth) WidgetOrder.Broadcast(); // neighbours must use our new width
+        }
+
+        if (TaskbarLayout.IsFullscreenAppActive(tb))
+        {
+            if (!_hiddenForFullscreen) Log.Debug("fullscreen app → hide");
+            _hiddenForFullscreen = true;
+            SetVisible(false);
+            return;
+        }
+        _hiddenForFullscreen = false;
+
+        int x = TaskbarLayout.ComputeX(tb, _name, _hwnd, _width);
+        _targetX = x;
+        _y = tb.Rect.Top;
+
+        if (!_placed || !_visible)
+        {
+            _x = x;          // snap: first placement / coming back from hidden
+            _placed = true;
+            Paint();
+            SetVisible(true);
+        }
+        else if (geometryChanged)
+        {
+            Paint();
+            if ((int)Math.Round(_x) != x) StartAnim();
+        }
+        else if ((int)Math.Round(_x) != x)
+        {
+            StartAnim();     // glide to the new slot
+        }
+    }
+
+    void SetVisible(bool visible)
+    {
+        if (visible == _visible) return;
+        _visible = visible;
+        if (visible)
+        {
+            Native.ShowWindow(_hwnd, Native.SW_SHOWNOACTIVATE);
+            Native.SetWindowPos(_hwnd, Native.HWND_TOPMOST, 0, 0, 0, 0,
+                Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE);
+        }
+        else
+        {
+            _tooltip.Hide();
+            Native.ShowWindow(_hwnd, Native.SW_HIDE);
+        }
+        WidgetOrder.Broadcast(); // others include/exclude us
+    }
+
+    void StartAnim()
+    {
+        _lastTick = Environment.TickCount64;
+        Native.SetTimer(_hwnd, TimerAnim, 15, IntPtr.Zero);
+    }
+
+    void AnimTick()
+    {
+        long now = Environment.TickCount64;
+        float dt = Math.Clamp(now - _lastTick, 1, 50) / 1000f;
+        _lastTick = now;
+        bool active = false, repaint = false, moved = false;
+
+        // Position: exponential glide (time-constant based, so frame drops don't change the speed).
+        if (!_dragging && Math.Abs(_targetX - _x) > 0.01)
+        {
+            double k = 1 - Math.Exp(-dt / 0.055);
+            _x += (_targetX - _x) * k;
+            if (Math.Abs(_targetX - _x) < 0.5) _x = _targetX; else active = true;
+            moved = true;
+        }
+
+        repaint |= Step(ref _hoverAnim, _mouseInside && !_dragging ? 1 : 0, dt / 0.12f, ref active);
+        repaint |= Step(ref _pressAnim, _mouseDown && !_dragging ? 1 : 0, dt / 0.08f, ref active);
+        for (int i = 0; i < _elemHover.Length; i++)
+            repaint |= Step(ref _elemHover[i], i == _hoverIndex && !_dragging ? 1 : 0, dt / 0.14f, ref active);
+
+        if (repaint) Paint(); // also presents at the new position
+        else if (moved)
+            Native.SetWindowPos(_hwnd, IntPtr.Zero, (int)Math.Round(_x), _y, 0, 0,
+                Native.SWP_NOSIZE | Native.SWP_NOZORDER | Native.SWP_NOACTIVATE | Native.SWP_NOOWNERZORDER);
+        if (!active) Native.KillTimer(_hwnd, TimerAnim);
+    }
+
+    static bool Step(ref float v, float target, float amount, ref bool active)
+    {
+        if (v == target) return false;
+        v = target > v ? Math.Min(target, v + amount) : Math.Max(target, v - amount);
+        if (v != target) active = true;
+        return true;
+    }
+
+    // ── Input ───────────────────────────────────────────────────────────
+
+    int HitTest(int px)
+    {
+        float s = _scale, ox = (InsetX + Padding) * s;
+        float half = (_ui?.Spacing ?? 0) * s / 2;
+        for (int i = 0; i < _elements.Count; i++)
+        {
+            var e = _elements[i];
+            if (e.IsSpacer || !e.Interactive) continue;
+            float l = ox + e.X * s - half, r = ox + (e.X + e.Width) * s + half;
+            if (px >= l && px < r) return i;
+        }
+        return -1;
+    }
+
+    (string? Title, string? Body) CurrentTooltip()
+    {
+        if (_hoverIndex >= 0 && _hoverIndex < _elements.Count)
+        {
+            var e = _elements[_hoverIndex];
+            if (e.TipTitle != null || e.TipBody != null) return (e.TipTitle, e.TipBody);
+        }
+        return (_ui?.TooltipTitle, _ui?.TooltipBody);
+    }
+
+    void ShowTooltip()
+    {
+        if (!_mouseInside || _dragging || _mouseDown || !_visible) return;
+        var (title, body) = CurrentTooltip();
+        float s = _scale;
+        var anchor = new Native.RECT
+        {
+            Left = (int)Math.Round(_x + InsetX * s), Right = (int)Math.Round(_x + _width - InsetX * s),
+            Top = _y + (int)(InsetY * s), Bottom = _y + _height,
+        };
+        _tooltip.Show(_hwnd, anchor, title, body, s, Theme.Current);
+    }
+
+    void ArmLeaveTracking()
+    {
+        var tme = new Native.TRACKMOUSEEVENT { cbSize = (uint)sizeof(Native.TRACKMOUSEEVENT), dwFlags = Native.TME_LEAVE, hwndTrack = _hwnd };
+        Native.TrackMouseEvent(&tme);
+    }
+
+    void OnMouseMove(int x)
+    {
+        // Re-armed on every move: capture (click/drag) can swallow the pending leave notification.
+        if (!_mouseDown) ArmLeaveTracking();
+        if (!_mouseInside)
+        {
+            _mouseInside = true;
+            Native.SetTimer(_hwnd, TimerTooltip, TooltipDelayMs, IntPtr.Zero);
+            StartAnim();
+        }
+
+        if (_mouseDown && !_dragging && _options.AllowReorder)
+        {
+            Native.GetCursorPos(out var p);
+            if (Math.Abs(p.X - _downScreenX) > 5 * _scale) BeginDrag();
+        }
+        if (_dragging)
+        {
+            Native.GetCursorPos(out var p);
+            DragTo(p.X);
+            return;
+        }
+
+        int idx = HitTest(x);
+        if (idx != _hoverIndex)
+        {
+            _hoverIndex = idx;
+            StartAnim();
+            if (_tooltip.IsVisible) ShowTooltip(); // update in place
+        }
+    }
+
+    void OnMouseLeave()
+    {
+        if (_dragging || _mouseDown) return; // captured; we'll get a real leave after release
+        _mouseInside = false;
+        _hoverIndex = -1;
+        Native.KillTimer(_hwnd, TimerTooltip);
+        _tooltip.Hide();
+        StartAnim();
+    }
+
+    void OnLeftDown(int x)
+    {
+        Log.Debug($"down x={x} hit={HitTest(x)}");
+        _mouseDown = true;
+        _pressIndex = HitTest(x);
+        Native.GetCursorPos(out var p);
+        _downScreenX = p.X;
+        Native.SetCapture(_hwnd);
+        Native.KillTimer(_hwnd, TimerTooltip);
+        _tooltip.Hide();
+        StartAnim();
+    }
+
+    void OnLeftUp(int x, int y)
+    {
+        Log.Debug($"up x={x} y={y} down={_mouseDown} drag={_dragging} press={_pressIndex} hit={HitTest(x)}");
+        if (!_mouseDown) return;
+        _mouseDown = false;
+        bool wasDragging = _dragging;
+        if (wasDragging) EndDrag(commit: true);
+        Native.ReleaseCapture();
+        StartAnim();
+
+        bool inside = x >= 0 && y >= 0 && x < _width && y < _height;
+        if (!inside) { OnMouseLeave(); return; }
+        ArmLeaveTracking();
+        if (wasDragging) return;
+
+        int idx = HitTest(x);
+        if (idx != _pressIndex) return;
+        var handler = idx >= 0 ? _elements[idx].Click : null;
+        (handler ?? _ui?.Click)?.Invoke();
+    }
+
+    void OnRightUp(int x)
+    {
+        int idx = HitTest(x);
+        var handler = idx >= 0 ? _elements[idx].RightClick : null;
+        handler ??= _ui?.RightClick;
+        bool shift = Native.GetKeyState(Native.VK_SHIFT) < 0;
+        if (handler == null || shift) ShowMenu();
+        else handler();
+    }
+
+    // ── Drag to reorder ─────────────────────────────────────────────────
+
+    void BeginDrag()
+    {
+        _dragging = true;
+        _dragOriginalOrder = new List<string>(WidgetOrder.Read());
+        _dragOffset = _downScreenX - (int)Math.Round(_x);
+        _lastPreview = null;
+        _pressIndex = -1;
+        Native.KillTimer(_hwnd, TimerTooltip);
+        _tooltip.Hide();
+        StartAnim();
+    }
+
+    void DragTo(int cursorX)
+    {
+        var tb = _tb;
+        int x = cursorX - _dragOffset;
+        if (!tb.Valid) return;
+        int minX = tb.Rect.Left + tb.Rect.Width / 3, maxX = tb.RightEdge - _width;
+        x = Math.Clamp(x, Math.Min(minX, maxX), maxX);
+        _x = _targetX = x;
+        Native.SetWindowPos(_hwnd, IntPtr.Zero, x, _y, 0, 0,
+            Native.SWP_NOSIZE | Native.SWP_NOZORDER | Native.SWP_NOACTIVATE | Native.SWP_NOOWNERZORDER);
+
+        // Pick the insertion slot whose centre is nearest ours. Slots come from the deterministic
+        // layout (not from where neighbours currently are mid-animation), so this can't flicker.
+        var order = WidgetOrder.Read();
+        var others = TaskbarLayout.RunningWidgets().Where(w => w.Hwnd != _hwnd)
+            .OrderBy(w => IndexOrMax(order, w.Name)).ThenBy(w => w.Name, StringComparer.Ordinal).ToList();
+
+        float myCenter = x + _width / 2f;
+        int best = 0; float bestDist = float.MaxValue, right = tb.RightEdge;
+        for (int k = 0; k <= others.Count; k++)
+        {
+            float d = MathF.Abs(right - _width / 2f - myCenter);
+            if (d < bestDist) { bestDist = d; best = k; }
+            if (k < others.Count) right -= others[k].Rect.Width;
+        }
+
+        var preview = others.Select(w => w.Name).ToList();
+        preview.Insert(best, _name);
+        if (_lastPreview == null || !_lastPreview.SequenceEqual(preview))
+        {
+            _lastPreview = preview;
+            WidgetOrder.Save(preview);
+            WidgetOrder.Broadcast();
+        }
+    }
+
+    static int IndexOrMax(List<string> order, string name) { int i = order.IndexOf(name); return i < 0 ? int.MaxValue : i; }
+
+    void EndDrag(bool commit)
+    {
+        if (!_dragging) return;
+        _dragging = false;
+        if (!commit && _dragOriginalOrder != null) WidgetOrder.Save(_dragOriginalOrder);
+        _dragOriginalOrder = null;
+        _lastPreview = null;
+        WidgetOrder.Broadcast();
+        Relayout(); // glide into the final slot
+    }
+
+    // ── Window procedure ────────────────────────────────────────────────
+
+    IntPtr WndProc(IntPtr hwnd, uint msg, IntPtr w, IntPtr l)
+    {
+        if (msg == WidgetOrder.RepositionMessage || (msg == _taskbarCreatedMsg && _taskbarCreatedMsg != 0))
+        {
+            RequestRelayout();
+            return 0;
+        }
+
+        switch (msg)
+        {
+            case WM_INVALIDATE:
+            {
+                _invalidatePending = 0;
+                int oldWidth = _width;
+                Rebuild();
+                if (_width != oldWidth && _placed && !_dragging)
+                {
+                    _x += oldWidth - _width;   // grow/shrink to the left, keeping the right edge put
+                    _targetX += oldWidth - _width;
+                }
+                Paint();
+                if (_width != oldWidth) { Relayout(); WidgetOrder.Broadcast(); }
+                if (_tooltip.IsVisible) ShowTooltip();
+                return 0;
+            }
+            case WM_RELAYOUT: Relayout(); return 0;
+            case WM_INVOKE: DrainInvokeQueue(); return 0;
+
+            case Native.WM_TIMER:
+            {
+                int id = (int)w;
+                if (id == TimerAnim) AnimTick();
+                else if (id == TimerSafety) Relayout(); // self-heal anything a missed event left behind
+                else if (id == TimerTooltip) { Native.KillTimer(hwnd, TimerTooltip); ShowTooltip(); }
+                else if (_timers.TryGetValue(id, out var t))
+                {
+                    if (t.Once) ClearTimer(id);
+                    try { t.Callback(); } catch (Exception ex) { Log.Write($"Timer callback failed: {ex}"); }
+                }
+                return 0;
+            }
+
+            case Native.WM_MOUSEMOVE: OnMouseMove(Native.LoWord(l)); return 0;
+            case Native.WM_MOUSELEAVE: OnMouseLeave(); return 0;
+            case Native.WM_LBUTTONDOWN: OnLeftDown(Native.LoWord(l)); return 0;
+            case Native.WM_LBUTTONUP: OnLeftUp(Native.LoWord(l), Native.HiWord(l)); return 0;
+            case Native.WM_RBUTTONUP: OnRightUp(Native.LoWord(l)); return 0;
+            case Native.WM_RBUTTONDOWN: return 0;
+            case Native.WM_MOUSEACTIVATE: return Native.MA_NOACTIVATE;
+            case Native.WM_CAPTURECHANGED:
+                if (l != hwnd)
+                {
+                    if (_dragging) EndDrag(commit: false);
+                    if (_mouseDown) { _mouseDown = false; _pressIndex = -1; StartAnim(); }
+                    if (_mouseInside) ArmLeaveTracking();
+                }
+                return 0;
+            case Native.WM_SETCURSOR:
+                Native.SetCursor(Native.LoadCursorW(IntPtr.Zero, _dragging ? Native.IDC_SIZEWE : Native.IDC_ARROW));
+                return 1;
+
+            case Native.WM_SETTINGCHANGE:
+            {
+                var area = l != IntPtr.Zero ? new string((char*)l) : null;
+                if (area == "ImmersiveColorSet")
+                {
+                    Theme.Refresh();
+                    try { Native.FlushMenuThemes(); } catch { }
+                    Rebuild();
+                    Paint();
+                }
+                RequestRelayout();
+                return 0;
+            }
+            case Native.WM_DISPLAYCHANGE: RequestRelayout(); return 0;
+            case Native.WM_DPICHANGED: RequestRelayout(); return 0; // DPI follows the taskbar, not the suggested rect
+            case Native.WM_POWERBROADCAST:
+                if ((int)w == Native.PBT_APMRESUMEAUTOMATIC)
+                {
+                    RequestRelayout();
+                    try { Resumed?.Invoke(); } catch (Exception ex) { Log.Write($"Resumed handler failed: {ex}"); }
+                }
+                return 1;
+
+            case Native.WM_DESTROY:
+                if (hwnd == _hwnd)
+                {
+                    _hwnd = IntPtr.Zero;
+                    _visible = false;
+                    if (!_closing) PostThreadMessageW(_uiThreadId, WM_THREAD_RECREATE, 0, 0);
+                }
+                return 0;
+        }
+        return Native.DefWindowProcW(hwnd, msg, w, l);
     }
 }

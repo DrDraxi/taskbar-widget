@@ -2,533 +2,216 @@ using System.Runtime.InteropServices;
 
 namespace TaskbarWidget;
 
-public static class Native
+/// <summary>Minimal Win32 surface. Everything is blittable so it is NativeAOT friendly.</summary>
+internal static unsafe class Native
 {
-    #region Constants
+    // ── Messages ────────────────────────────────────────────────────────
+    public const uint WM_CREATE = 0x0001, WM_DESTROY = 0x0002, WM_SETTINGCHANGE = 0x001A,
+        WM_SETCURSOR = 0x0020, WM_MOUSEACTIVATE = 0x0021, WM_DISPLAYCHANGE = 0x007E,
+        WM_NCCREATE = 0x0081, WM_NCDESTROY = 0x0082, WM_KEYDOWN = 0x0100, WM_TIMER = 0x0113,
+        WM_MOUSEMOVE = 0x0200, WM_LBUTTONDOWN = 0x0201, WM_LBUTTONUP = 0x0202, WM_LBUTTONDBLCLK = 0x0203,
+        WM_RBUTTONDOWN = 0x0204, WM_RBUTTONUP = 0x0205, WM_RBUTTONDBLCLK = 0x0206,
+        WM_MBUTTONUP = 0x0208, WM_CAPTURECHANGED = 0x0215, WM_POWERBROADCAST = 0x0218,
+        WM_MOUSELEAVE = 0x02A3, WM_DPICHANGED = 0x02E0, WM_THEMECHANGED = 0x031A,
+        WM_APP = 0x8000;
 
-    public const int WS_POPUP = unchecked((int)0x80000000);
-    public const int WS_EX_LAYERED = 0x00080000;
-    public const int WS_EX_TOOLWINDOW = 0x00000080;
-    public const int WS_EX_TOPMOST = 0x00000008;
-    public const int WS_EX_NOACTIVATE = 0x08000000;
+    public const int MA_NOACTIVATE = 3;
+    public const int PBT_APMRESUMEAUTOMATIC = 0x12;
+    public const int VK_ESCAPE = 0x1B, VK_SHIFT = 0x10;
 
-    public const int SWP_NOSIZE = 0x0001;
-    public const int SWP_NOMOVE = 0x0002;
-    public const int SWP_NOZORDER = 0x0004;
-    public const int SWP_NOACTIVATE = 0x0010;
-    public const int SWP_SHOWWINDOW = 0x0040;
+    // ── Styles ──────────────────────────────────────────────────────────
+    public const uint WS_POPUP = 0x80000000;
+    public const uint WS_EX_TOPMOST = 0x8, WS_EX_TRANSPARENT = 0x20, WS_EX_TOOLWINDOW = 0x80,
+        WS_EX_LAYERED = 0x80000, WS_EX_NOACTIVATE = 0x8000000;
+    public const uint CS_DBLCLKS = 0x8;
 
-    public static readonly IntPtr HWND_TOPMOST = (IntPtr)(-1);
+    public const uint SWP_NOSIZE = 0x1, SWP_NOMOVE = 0x2, SWP_NOZORDER = 0x4, SWP_NOACTIVATE = 0x10,
+        SWP_SHOWWINDOW = 0x40, SWP_NOOWNERZORDER = 0x200;
+    public const int SW_HIDE = 0, SW_SHOWNOACTIVATE = 4;
+    public static readonly IntPtr HWND_TOPMOST = -1;
+    public static readonly IntPtr HWND_BROADCAST = 0xFFFF;
 
-    public const int SW_HIDE = 0;
-    public const int SW_SHOW = 5;
+    public const int GWLP_USERDATA = -21;
+    public const uint MONITOR_DEFAULTTONEAREST = 2;
+    public const uint ULW_ALPHA = 2;
+    public const uint TME_LEAVE = 2;
+    public const int IDC_ARROW = 32512, IDC_SIZEWE = 32644, IDC_HAND = 32649;
 
-    public const uint WM_PAINT = 0x000F;
-    public const uint WM_MOUSEMOVE = 0x0200;
-    public const uint WM_MOUSELEAVE = 0x02A3;
-    public const uint WM_LBUTTONDOWN = 0x0201;
-    public const uint WM_LBUTTONUP = 0x0202;
-    public const uint WM_LBUTTONDBLCLK = 0x0203;
-    public const uint WM_RBUTTONDOWN = 0x0204;
-    public const uint WM_RBUTTONUP = 0x0205;
-    public const uint WM_RBUTTONDBLCLK = 0x0206;
-    public const uint WM_TIMER = 0x0113;
-    public const uint WM_SETTINGCHANGE = 0x001A;
-    public const uint WM_DISPLAYCHANGE = 0x007E;
-    public const uint WM_DROPFILES = 0x0233;
-    public const uint WM_SETCURSOR = 0x0020;
-    public const uint WM_CAPTURECHANGED = 0x0215;
-    public const uint WM_DPICHANGED = 0x02E1;
-    public const uint WM_DESTROY = 0x0002;
-    public const uint WM_USER = 0x0400;
-    public const uint WM_NOTIFY = 0x004E;
+    public const uint EVENT_SYSTEM_FOREGROUND = 0x0003, EVENT_OBJECT_LOCATIONCHANGE = 0x800B;
+    public const uint WINEVENT_OUTOFCONTEXT = 0, WINEVENT_SKIPOWNPROCESS = 2;
 
-    // Window class styles
-    public const uint CS_DBLCLKS = 0x0008;
+    public const uint MF_STRING = 0, MF_GRAYED = 1, MF_CHECKED = 8, MF_SEPARATOR = 0x800;
+    public const uint TPM_RIGHTBUTTON = 0x2, TPM_BOTTOMALIGN = 0x20, TPM_RETURNCMD = 0x100, TPM_NONOTIFY = 0x80;
 
-    // GDI constants
-    public const int TRANSPARENT = 1;
-    public const int DT_CENTER = 0x01;
-    public const int DT_VCENTER = 0x04;
-    public const int DT_SINGLELINE = 0x20;
-    public const int DT_WORDBREAK = 0x10;
-    public const int DT_CALCRECT = 0x00000400;
-    public const int DT_NOPREFIX = 0x00000800;
-    public const int FW_NORMAL = 400;
-    public const int FW_BOLD = 700;
-    public const int DEFAULT_CHARSET = 1;
-    public const int OUT_DEFAULT_PRECIS = 0;
-    public const int CLIP_DEFAULT_PRECIS = 0;
-    public const int CLEARTYPE_QUALITY = 5;
-    public const int DEFAULT_PITCH = 0;
+    public const int DWMWA_CLOAKED = 14;
 
-    // Tooltip constants
-    public const string TOOLTIPS_CLASS = "tooltips_class32";
-    public const int WS_POPUP_TT = unchecked((int)0x80000000);
-    public const int TTS_ALWAYSTIP = 0x01;
-    public const int TTS_NOPREFIX = 0x02;
-    public const int TTF_SUBCLASS = 0x0010;
-    public const int TTF_IDISHWND = 0x0001;
-    public const int TTM_ADDTOOL = 0x0432;       // WM_USER + 50 (Unicode)
-    public const int TTM_UPDATETIPTEXT = 0x0439;  // WM_USER + 57 (Unicode)
-    public const int TTM_SETMAXTIPWIDTH = 0x0418; // WM_USER + 24
+    // ── Structs ─────────────────────────────────────────────────────────
+    [StructLayout(LayoutKind.Sequential)]
+    public struct POINT { public int X, Y; }
 
-    // TrackMouseEvent
-    public const uint TME_LEAVE = 0x00000002;
-
-    #endregion
-
-    #region Structs
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SIZE { public int cx, cy; }
 
     [StructLayout(LayoutKind.Sequential)]
     public struct RECT
     {
-        public int Left;
-        public int Top;
-        public int Right;
-        public int Bottom;
-        public int Width => Right - Left;
-        public int Height => Bottom - Top;
-    }
-
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    public struct WNDCLASS
-    {
-        public uint style;
-        public IntPtr lpfnWndProc;
-        public int cbClsExtra;
-        public int cbWndExtra;
-        public IntPtr hInstance;
-        public IntPtr hIcon;
-        public IntPtr hCursor;
-        public IntPtr hbrBackground;
-        public string lpszMenuName;
-        public string lpszClassName;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    public struct PAINTSTRUCT
-    {
-        public IntPtr hdc;
-        public bool fErase;
-        public RECT rcPaint;
-        public bool fRestore;
-        public bool fIncUpdate;
-        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 32)]
-        public byte[] rgbReserved;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    public struct TRACKMOUSEEVENT
-    {
-        public uint cbSize;
-        public uint dwFlags;
-        public IntPtr hwndTrack;
-        public uint dwHoverTime;
-    }
-
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    public struct TOOLINFO
-    {
-        public int cbSize;
-        public int uFlags;
-        public IntPtr hwnd;
-        public IntPtr uId;
-        public RECT rect;
-        public IntPtr hinst;
-        public string lpszText;
-        public IntPtr lParam;
+        public int Left, Top, Right, Bottom;
+        public readonly int Width => Right - Left;
+        public readonly int Height => Bottom - Top;
+        public override readonly string ToString() => $"[{Left},{Top} {Width}x{Height}]";
     }
 
     [StructLayout(LayoutKind.Sequential)]
     public struct MSG
     {
-        public IntPtr hwnd;
-        public uint message;
-        public IntPtr wParam;
-        public IntPtr lParam;
-        public uint time;
-        public int pt_x;
-        public int pt_y;
-    }
-
-    #endregion
-
-    #region Window Functions
-
-    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    public static extern IntPtr FindWindowW(string? lpClassName, string? lpWindowName);
-
-    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    public static extern IntPtr FindWindowExW(IntPtr hWndParent, IntPtr hWndChildAfter, string? lpszClass, string? lpszWindow);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    public static extern IntPtr SetParent(IntPtr hWndChild, IntPtr hWndNewParent);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    public static extern IntPtr GetParent(IntPtr hWnd);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static extern bool GetClientRect(IntPtr hWnd, out RECT lpRect);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static extern bool IsWindowVisible(IntPtr hWnd);
-
-    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    public static extern int GetClassNameW(IntPtr hWnd, System.Text.StringBuilder lpClassName, int nMaxCount);
-
-    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static extern bool EnumChildWindows(IntPtr hWndParent, EnumWindowsProc lpEnumFunc, IntPtr lParam);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static extern bool DestroyWindow(IntPtr hWnd);
-
-    [DllImport("user32.dll")]
-    public static extern uint GetDpiForWindow(IntPtr hwnd);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static extern bool InvalidateRect(IntPtr hWnd, IntPtr lpRect, bool bErase);
-
-    public const uint LWA_ALPHA = 0x02;
-
-    [DllImport("user32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static extern bool SetLayeredWindowAttributes(IntPtr hwnd, uint crKey, byte bAlpha, uint dwFlags);
-
-    [DllImport("user32.dll")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static extern bool TrackMouseEvent(ref TRACKMOUSEEVENT lpEventTrack);
-
-    [DllImport("user32.dll")]
-    public static extern IntPtr SetTimer(IntPtr hWnd, IntPtr nIDEvent, uint uElapse, IntPtr lpTimerFunc);
-
-    [DllImport("user32.dll")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static extern bool KillTimer(IntPtr hWnd, IntPtr uIDEvent);
-
-    [DllImport("user32.dll")]
-    public static extern IntPtr SetCapture(IntPtr hWnd);
-
-    [DllImport("user32.dll")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static extern bool ReleaseCapture();
-
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    public static extern IntPtr LoadCursorW(IntPtr hInstance, int lpCursorName);
-
-    public const int IDC_ARROW = 32512;
-    public const int IDC_HAND = 32649;
-    public const int IDC_SIZEALL = 32646;
-
-    [DllImport("user32.dll")]
-    public static extern IntPtr SetCursor(IntPtr hCursor);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static extern bool GetCursorPos(out POINT lpPoint);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static extern bool ScreenToClient(IntPtr hWnd, ref POINT lpPoint);
-
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    public static extern uint RegisterWindowMessageW(string lpString);
-
-    [DllImport("user32.dll")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static extern bool PostMessageW(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
-
-    public const IntPtr HWND_BROADCAST = (nint)0xFFFF;
-
-    // Drag-and-drop
-    [DllImport("shell32.dll")]
-    public static extern void DragAcceptFiles(IntPtr hWnd, [MarshalAs(UnmanagedType.Bool)] bool fAccept);
-
-    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
-    public static extern uint DragQueryFileW(IntPtr hDrop, uint iFile, System.Text.StringBuilder? lpszFile, uint cch);
-
-    [DllImport("shell32.dll")]
-    public static extern void DragFinish(IntPtr hDrop);
-
-    // Monitor info for tooltip clamping
-    [DllImport("user32.dll")]
-    public static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
-
-    public const uint MONITOR_DEFAULTTONEAREST = 2;
-
-    [StructLayout(LayoutKind.Sequential)]
-    public struct MONITORINFO
-    {
-        public int cbSize;
-        public RECT rcMonitor;
-        public RECT rcWork;
-        public uint dwFlags;
-    }
-
-    [DllImport("user32.dll")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static extern bool GetMonitorInfoW(IntPtr hMonitor, ref MONITORINFO lpmi);
-
-    #endregion
-
-    #region Window Class Registration
-
-    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    public static extern ushort RegisterClassW(ref WNDCLASS lpWndClass);
-
-    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    public static extern IntPtr CreateWindowExW(
-        int dwExStyle, string lpClassName, string lpWindowName, int dwStyle,
-        int x, int y, int nWidth, int nHeight,
-        IntPtr hWndParent, IntPtr hMenu, IntPtr hInstance, IntPtr lpParam);
-
-    [DllImport("user32.dll")]
-    public static extern IntPtr DefWindowProcW(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
-
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
-    public static extern IntPtr GetModuleHandleW(string? lpModuleName);
-
-    #endregion
-
-    #region Message Loop
-
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static extern bool GetMessageW(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
-
-    [DllImport("user32.dll")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static extern bool TranslateMessage(ref MSG lpMsg);
-
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    public static extern IntPtr DispatchMessageW(ref MSG lpMsg);
-
-    [DllImport("user32.dll")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static extern bool PostQuitMessage(int nExitCode);
-
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    public static extern IntPtr SendMessageW(IntPtr hWnd, int msg, IntPtr wParam, ref TOOLINFO lParam);
-
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    public static extern IntPtr SendMessageW(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
-
-    #endregion
-
-    #region GDI Functions
-
-    [DllImport("user32.dll")]
-    public static extern IntPtr BeginPaint(IntPtr hWnd, out PAINTSTRUCT lpPaint);
-
-    [DllImport("user32.dll")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static extern bool EndPaint(IntPtr hWnd, ref PAINTSTRUCT lpPaint);
-
-    [DllImport("gdi32.dll", CharSet = CharSet.Unicode)]
-    public static extern IntPtr CreateFontW(
-        int cHeight, int cWidth, int cEscapement, int cOrientation, int cWeight,
-        uint bItalic, uint bUnderline, uint bStrikeOut, uint iCharSet,
-        uint iOutPrecis, uint iClipPrecis, uint iQuality, uint iPitchAndFamily,
-        string pszFaceName);
-
-    [DllImport("gdi32.dll")]
-    public static extern IntPtr SelectObject(IntPtr hdc, IntPtr h);
-
-    [DllImport("gdi32.dll")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static extern bool DeleteObject(IntPtr ho);
-
-    [DllImport("gdi32.dll")]
-    public static extern int SetBkMode(IntPtr hdc, int mode);
-
-    [DllImport("gdi32.dll")]
-    public static extern uint SetTextColor(IntPtr hdc, uint color);
-
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    public static extern int DrawTextW(IntPtr hdc, string lpchText, int cchText, ref RECT lprc, uint format);
-
-    [DllImport("user32.dll")]
-    public static extern int FillRect(IntPtr hDC, ref RECT lprc, IntPtr hbr);
-
-    [DllImport("gdi32.dll")]
-    public static extern IntPtr CreateSolidBrush(uint crColor);
-
-    #endregion
-
-    #region UpdateLayeredWindow
-
-    [StructLayout(LayoutKind.Sequential)]
-    public struct POINT
-    {
-        public int X;
-        public int Y;
+        public IntPtr hwnd; public uint message; public IntPtr wParam, lParam;
+        public uint time; public POINT pt; public uint lPrivate;
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    public struct SIZE
+    public struct WNDCLASSEXW
     {
-        public int cx;
-        public int cy;
+        public uint cbSize, style;
+        public IntPtr lpfnWndProc;
+        public int cbClsExtra, cbWndExtra;
+        public IntPtr hInstance, hIcon, hCursor, hbrBackground;
+        public char* lpszMenuName, lpszClassName;
+        public IntPtr hIconSm;
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    public struct BLENDFUNCTION
-    {
-        public byte BlendOp;
-        public byte BlendFlags;
-        public byte SourceConstantAlpha;
-        public byte AlphaFormat;
-    }
+    public struct CREATESTRUCTW { public IntPtr lpCreateParams; /* rest unused */ }
 
-    public const byte AC_SRC_OVER = 0x00;
-    public const byte AC_SRC_ALPHA = 0x01;
-    public const uint ULW_ALPHA = 0x00000002;
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MONITORINFO { public uint cbSize; public RECT rcMonitor, rcWork; public uint dwFlags; }
 
-    [DllImport("user32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static extern bool UpdateLayeredWindow(
-        IntPtr hwnd, IntPtr hdcDst, ref POINT pptDst, ref SIZE psize,
-        IntPtr hdcSrc, ref POINT pptSrc, uint crKey, ref BLENDFUNCTION pblend, uint dwFlags);
-
-    [DllImport("user32.dll")]
-    public static extern IntPtr GetDC(IntPtr hWnd);
-
-    [DllImport("user32.dll")]
-    public static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
-
-    [DllImport("gdi32.dll")]
-    public static extern IntPtr CreateCompatibleDC(IntPtr hdc);
-
-    [DllImport("gdi32.dll")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static extern bool DeleteDC(IntPtr hdc);
+    [StructLayout(LayoutKind.Sequential)]
+    public struct BLENDFUNCTION { public byte BlendOp, BlendFlags, SourceConstantAlpha, AlphaFormat; }
 
     [StructLayout(LayoutKind.Sequential)]
     public struct BITMAPINFOHEADER
     {
-        public int biSize;
-        public int biWidth;
-        public int biHeight;
-        public short biPlanes;
-        public short biBitCount;
-        public int biCompression;
-        public int biSizeImage;
-        public int biXPelsPerMeter;
-        public int biYPelsPerMeter;
-        public int biClrUsed;
-        public int biClrImportant;
+        public uint biSize; public int biWidth, biHeight; public ushort biPlanes, biBitCount;
+        public uint biCompression, biSizeImage; public int biXPelsPerMeter, biYPelsPerMeter;
+        public uint biClrUsed, biClrImportant;
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    public struct BITMAPINFO
-    {
-        public BITMAPINFOHEADER bmiHeader;
-    }
+    public struct TRACKMOUSEEVENT { public uint cbSize, dwFlags; public IntPtr hwndTrack; public uint dwHoverTime; }
 
-    public const int DIB_RGB_COLORS = 0;
-    public const int BI_RGB = 0;
+    // ── user32 ──────────────────────────────────────────────────────────
+    const string U = "user32.dll";
 
-    [DllImport("gdi32.dll")]
-    public static extern IntPtr CreateDIBSection(IntPtr hdc, ref BITMAPINFO pbmi, uint usage,
-        out IntPtr ppvBits, IntPtr hSection, uint offset);
+    [DllImport(U, CharSet = CharSet.Unicode, ExactSpelling = true)] public static extern ushort RegisterClassExW(WNDCLASSEXW* wc);
+    [DllImport(U, CharSet = CharSet.Unicode, ExactSpelling = true)]
+    public static extern IntPtr CreateWindowExW(uint exStyle, string className, string? title, uint style,
+        int x, int y, int w, int h, IntPtr parent, IntPtr menu, IntPtr instance, IntPtr param);
+    [DllImport(U, ExactSpelling = true)] public static extern bool DestroyWindow(IntPtr hwnd);
+    [DllImport(U, ExactSpelling = true)] public static extern IntPtr DefWindowProcW(IntPtr hwnd, uint msg, IntPtr w, IntPtr l);
+    [DllImport(U, ExactSpelling = true)] public static extern int GetMessageW(MSG* msg, IntPtr hwnd, uint min, uint max);
+    [DllImport(U, ExactSpelling = true)] public static extern bool TranslateMessage(MSG* msg);
+    [DllImport(U, ExactSpelling = true)] public static extern IntPtr DispatchMessageW(MSG* msg);
+    [DllImport(U, ExactSpelling = true)] public static extern void PostQuitMessage(int code);
+    [DllImport(U, ExactSpelling = true)] public static extern bool PostMessageW(IntPtr hwnd, uint msg, IntPtr w, IntPtr l);
+    [DllImport(U, CharSet = CharSet.Unicode, ExactSpelling = true)] public static extern uint RegisterWindowMessageW(string name);
 
-    #endregion
+    [DllImport(U, ExactSpelling = true)] public static extern IntPtr SetWindowLongPtrW(IntPtr hwnd, int index, IntPtr value);
+    [DllImport(U, ExactSpelling = true)] public static extern IntPtr GetWindowLongPtrW(IntPtr hwnd, int index);
+    [DllImport(U, ExactSpelling = true)] public static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int w, int h, uint flags);
+    [DllImport(U, ExactSpelling = true)] public static extern bool ShowWindow(IntPtr hwnd, int cmd);
+    [DllImport(U, ExactSpelling = true)] public static extern bool IsWindow(IntPtr hwnd);
+    [DllImport(U, ExactSpelling = true)] public static extern bool IsWindowVisible(IntPtr hwnd);
+    [DllImport(U, ExactSpelling = true)] public static extern bool IsZoomed(IntPtr hwnd);
+    [DllImport(U, ExactSpelling = true)] public static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
+    [DllImport(U, ExactSpelling = true)] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+    [DllImport(U, CharSet = CharSet.Unicode, ExactSpelling = true)] public static extern IntPtr FindWindowW(string? cls, string? title);
+    [DllImport(U, CharSet = CharSet.Unicode, ExactSpelling = true)] public static extern IntPtr FindWindowExW(IntPtr parent, IntPtr after, string? cls, string? title);
+    [DllImport(U, ExactSpelling = true)] public static extern int GetClassNameW(IntPtr hwnd, char* buf, int max);
+    [DllImport(U, ExactSpelling = true)] public static extern bool EnumWindows(delegate* unmanaged<IntPtr, IntPtr, int> cb, IntPtr l);
+    [DllImport(U, ExactSpelling = true)] public static extern IntPtr GetForegroundWindow();
+    [DllImport(U, ExactSpelling = true, SetLastError = true)] public static extern bool SetForegroundWindow(IntPtr hwnd);
+    [DllImport(U, ExactSpelling = true)] public static extern IntPtr GetShellWindow();
+    [DllImport(U, ExactSpelling = true)] public static extern IntPtr GetDesktopWindow();
 
-    #region Theme Detection
+    [DllImport(U, ExactSpelling = true)] public static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
+    [DllImport(U, ExactSpelling = true)] public static extern IntPtr MonitorFromRect(RECT* rect, uint flags);
+    [DllImport(U, ExactSpelling = true)] public static extern bool GetMonitorInfoW(IntPtr mon, MONITORINFO* mi);
+    [DllImport(U, ExactSpelling = true)] public static extern uint GetDpiForWindow(IntPtr hwnd);
+    [DllImport(U, ExactSpelling = true)] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr ctx);
 
-    [DllImport("uxtheme.dll", EntryPoint = "#138")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static extern bool ShouldSystemUseDarkMode();
+    [DllImport(U, ExactSpelling = true)]
+    public static extern bool UpdateLayeredWindow(IntPtr hwnd, IntPtr hdcDst, POINT* pptDst, SIZE* psize,
+        IntPtr hdcSrc, POINT* pptSrc, uint crKey, BLENDFUNCTION* blend, uint flags);
 
-    #endregion
+    [DllImport(U, ExactSpelling = true)] public static extern IntPtr SetCapture(IntPtr hwnd);
+    [DllImport(U, ExactSpelling = true)] public static extern bool ReleaseCapture();
+    [DllImport(U, ExactSpelling = true)] public static extern IntPtr GetCapture();
+    [DllImport(U, ExactSpelling = true)] public static extern bool GetCursorPos(out POINT pt);
+    [DllImport(U, ExactSpelling = true)] public static extern bool TrackMouseEvent(TRACKMOUSEEVENT* tme);
+    [DllImport(U, ExactSpelling = true)] public static extern IntPtr LoadCursorW(IntPtr inst, IntPtr name);
+    [DllImport(U, ExactSpelling = true)] public static extern IntPtr SetCursor(IntPtr cursor);
+    [DllImport(U, ExactSpelling = true)] public static extern short GetKeyState(int vk);
 
-    #region Comctl32 (InitCommonControlsEx)
+    [DllImport(U, ExactSpelling = true)] public static extern IntPtr SetTimer(IntPtr hwnd, IntPtr id, uint ms, IntPtr proc);
+    [DllImport(U, ExactSpelling = true)] public static extern bool KillTimer(IntPtr hwnd, IntPtr id);
 
-    [StructLayout(LayoutKind.Sequential)]
-    public struct INITCOMMONCONTROLSEX
-    {
-        public int dwSize;
-        public int dwICC;
-    }
+    [DllImport(U, ExactSpelling = true)] public static extern IntPtr GetDC(IntPtr hwnd);
+    [DllImport(U, ExactSpelling = true)] public static extern int ReleaseDC(IntPtr hwnd, IntPtr hdc);
 
-    public const int ICC_WIN95_CLASSES = 0x000000FF;
+    [DllImport(U, ExactSpelling = true)]
+    public static extern IntPtr SetWinEventHook(uint min, uint max, IntPtr mod,
+        delegate* unmanaged<IntPtr, uint, IntPtr, int, int, uint, uint, void> proc, uint pid, uint tid, uint flags);
+    [DllImport(U, ExactSpelling = true)] public static extern bool UnhookWinEvent(IntPtr hook);
 
-    [DllImport("comctl32.dll")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static extern bool InitCommonControlsEx(ref INITCOMMONCONTROLSEX lpInitCtrls);
+    [DllImport(U, ExactSpelling = true)] public static extern IntPtr CreatePopupMenu();
+    [DllImport(U, CharSet = CharSet.Unicode, ExactSpelling = true)] public static extern bool AppendMenuW(IntPtr menu, uint flags, IntPtr id, string? text);
+    [DllImport(U, ExactSpelling = true, SetLastError = true)] public static extern int TrackPopupMenuEx(IntPtr menu, uint flags, int x, int y, IntPtr hwnd, IntPtr tpm);
+    [DllImport(U, ExactSpelling = true)] public static extern bool DestroyMenu(IntPtr menu);
 
-    #endregion
+    // ── gdi32 ───────────────────────────────────────────────────────────
+    [DllImport("gdi32.dll", ExactSpelling = true)] public static extern IntPtr CreateCompatibleDC(IntPtr hdc);
+    [DllImport("gdi32.dll", ExactSpelling = true)] public static extern bool DeleteDC(IntPtr hdc);
+    [DllImport("gdi32.dll", ExactSpelling = true)] public static extern IntPtr SelectObject(IntPtr hdc, IntPtr obj);
+    [DllImport("gdi32.dll", ExactSpelling = true)] public static extern bool DeleteObject(IntPtr obj);
+    [DllImport("gdi32.dll", ExactSpelling = true)]
+    public static extern IntPtr CreateDIBSection(IntPtr hdc, BITMAPINFOHEADER* bmi, uint usage, void** bits, IntPtr section, uint offset);
 
-    #region Fullscreen Detection
+    // ── misc ────────────────────────────────────────────────────────────
+    [DllImport("kernel32.dll", ExactSpelling = true)] public static extern IntPtr GetModuleHandleW(IntPtr name);
+    [DllImport("ole32.dll", ExactSpelling = true)] public static extern int CoInitializeEx(IntPtr reserved, uint coinit);
+    [DllImport("dwmapi.dll", ExactSpelling = true)] public static extern int DwmGetWindowAttribute(IntPtr hwnd, int attr, void* value, int size);
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    public static extern IntPtr ShellExecuteW(IntPtr hwnd, string? op, string file, string? args, string? dir, int show);
 
-    [DllImport("user32.dll")]
-    public static extern IntPtr GetForegroundWindow();
+    // Undocumented but stable since 1809: lets Win32 menus follow dark mode.
+    [DllImport("uxtheme.dll", EntryPoint = "#135")] public static extern int SetPreferredAppMode(int mode);
+    [DllImport("uxtheme.dll", EntryPoint = "#136")] public static extern void FlushMenuThemes();
 
-    [DllImport("user32.dll")]
-    public static extern IntPtr GetDesktopWindow();
-
-    [DllImport("user32.dll")]
-    public static extern IntPtr GetShellWindow();
-
-    #endregion
-
-    #region Helper Methods
-
-    public static IntPtr FindTaskbar() => FindWindowW("Shell_TrayWnd", null);
-
-    public static IntPtr FindTrayNotifyWnd(IntPtr taskbar) =>
-        FindWindowExW(taskbar, IntPtr.Zero, "TrayNotifyWnd", null);
-
-    public static double GetScaleFactor(IntPtr hwnd)
-    {
-        var dpi = GetDpiForWindow(hwnd);
-        return dpi == 0 ? 1.0 : dpi / 96.0;
-    }
-
+    // ── helpers ─────────────────────────────────────────────────────────
     public static string GetClassName(IntPtr hwnd)
     {
-        var sb = new System.Text.StringBuilder(256);
-        GetClassNameW(hwnd, sb, sb.Capacity);
-        return sb.ToString();
+        char* buf = stackalloc char[128];
+        int n = GetClassNameW(hwnd, buf, 128);
+        return n > 0 ? new string(buf, 0, n) : string.Empty;
     }
 
-    /// <summary>
-    /// Extract DPI scale factor from WM_DPICHANGED wParam.
-    /// The new DPI is in the low word of wParam.
-    /// </summary>
-    public static double GetDpiScaleFromWParam(IntPtr wParam)
+    /// <summary>Cheap check against a known class prefix without allocating for non-matches.</summary>
+    public static bool ClassStartsWith(IntPtr hwnd, string prefix)
     {
-        int newDpi = wParam.ToInt32() & 0xFFFF;
-        return newDpi == 0 ? 1.0 : newDpi / 96.0;
+        char* buf = stackalloc char[128];
+        int n = GetClassNameW(hwnd, buf, 128);
+        if (n < prefix.Length) return false;
+        for (int i = 0; i < prefix.Length; i++)
+            if (buf[i] != prefix[i]) return false;
+        return true;
     }
 
-    /// <summary>
-    /// Convert R, G, B to a COLORREF (0x00BBGGRR).
-    /// </summary>
-    public static uint RGB(byte r, byte g, byte b) => (uint)(r | (g << 8) | (b << 16));
+    public static bool IsCloaked(IntPtr hwnd)
+    {
+        int cloaked = 0;
+        return DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(int)) == 0 && cloaked != 0;
+    }
 
-    #endregion
+    public static int LoWord(IntPtr v) => (short)((long)v & 0xFFFF);
+    public static int HiWord(IntPtr v) => (short)(((long)v >> 16) & 0xFFFF);
 }
